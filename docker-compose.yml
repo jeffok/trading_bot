@@ -1,97 +1,66 @@
-version: '3.8'
 
 services:
-  # --- 基础设施 (如果使用外部服务，请注释掉这两块) ---
   mariadb:
-    image: mariadb:10.6
-    container_name: asv8-db
+    image: mariadb:11
     environment:
-      MYSQL_ROOT_PASSWORD: password
-      MYSQL_DATABASE: alpha_sniper_v8
-      TZ: Asia/Hong_Kong
-    volumes:
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-      - mariadb_data:/var/lib/mysql
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASS}
+      MARIADB_ROOT_PASSWORD: root_pass
     ports:
       - "3306:3306"
-    networks:
-      - asv8-net
+    volumes:
+      - mariadb_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 20
 
   redis:
-    image: redis:6-alpine
-    container_name: asv8-redis
+    image: redis:7
     ports:
       - "6379:6379"
-    networks:
-      - asv8-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
-  # --- 核心服务 ---
-
-  # 1. 数据同步服务
-  data-syncer:
-    build: .
-    container_name: asv8-syncer
-    command: python -u -m data.syncer
-    restart: always
-    environment:
-      - DB_HOST=mariadb # 如果是外部库，填宿主机IP
-      - REDIS_HOST=redis
-      - TZ=Asia/Hong_Kong
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-    networks:
-      - asv8-net
-
-  # 2. 策略引擎
-  strategy-engine:
-    build: .
-    container_name: asv8-engine
-    command: python -u -m strategy.engine
-    restart: always
-    environment:
-      - DB_HOST=mariadb
-      - REDIS_HOST=redis
-      - TZ=Asia/Hong_Kong
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-    networks:
-      - asv8-net
-
-  # 3. API 服务 (含 CLI 环境)
   api-service:
-    build: .
-    container_name: asv8-api
-    # 启动 uvicorn
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
-    restart: always
+    build:
+      context: alpha-sniper-v8
+      dockerfile: services/api_service/Dockerfile
+    env_file: .env
     ports:
-      - "8000:8000"
-    environment:
-      - DB_HOST=mariadb
-      - REDIS_HOST=redis
-      - TZ=Asia/Hong_Kong
-    env_file:
-      - .env
+      - "8080:8080"
     depends_on:
       mariadb:
         condition: service_healthy
-    networks:
-      - asv8-net
+      redis:
+        condition: service_healthy
+
+  data-syncer:
+    build:
+      context: alpha-sniper-v8
+      dockerfile: services/data_syncer/Dockerfile
+    env_file: .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  strategy-engine:
+    build:
+      context: alpha-sniper-v8
+      dockerfile: services/strategy_engine/Dockerfile
+    env_file: .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   mariadb_data:
-
-networks:
-  asv8-net:
-    driver: bridge

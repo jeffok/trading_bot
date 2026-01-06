@@ -1,140 +1,94 @@
-# Alpha-Sniper-V8（B-lite）
 
-本仓库实现 **B-lite 架构**（三服务），用于构建可长期运行、可审计、可观测的多币种逐仓量化交易系统。
+# Alpha-Sniper-V8 (B-lite) - MVP Reference Implementation
 
----
+这是一个按照你提供的 V8.3 规格文档实现的 **可运行 MVP** 代码库骨架，目标是：
 
-## 架构概览
+- 三服务架构：`data-syncer` / `strategy-engine` / `api-service`
+- 交易所：支持 **Binance** 与 **Bybit**（运行时二选一，不会同时使用多个交易所）
+- 核心不变量：幂等下单（`client_order_id` / `orderLinkId`）、事件流 `order_events`、分布式锁、可观测性（/health /metrics）、可恢复（对账补写）
+- 数据：MariaDB（强一致事件与历史）、Redis（锁/速率限制状态）
 
-包含三个服务：
-
-- **strategy-engine（策略引擎）**  
-  信号计算 → 风控校验 → 订单执行 → 成交对账 → 审计落库（事件流/快照/交易日志）
-
-- **data-syncer（数据同步）**  
-  K 线同步与补洞 → 清洗标准化 → 指标/特征预计算缓存 → 自动归档（热数据 90 天）
-
-- **api-service（控制面）**  
-  健康检查（汇总）/指标（Prometheus）/管理接口（热配置、停开仓、一键清仓）+ Telegram 告警
+> ⚠️ 交易有风险。默认建议先使用 `EXCHANGE=paper`（纸交易）验证端到端流程，再切换真实交易所并设置较小仓位。
 
 ---
 
-## 前置条件
+## 1. 快速启动（Docker Compose）
 
-你已经具备：
-
-- 独立部署的 **MariaDB**
-- 独立部署的 **Redis**
-
-说明：
-
-- 本项目 **不会安装 MariaDB/Redis**，只会通过环境变量连接你已有的服务。
-- MariaDB 用户需要对目标库具有 **CREATE / ALTER / INDEX / INSERT / UPDATE / SELECT** 等权限（用于自动迁移与运行时写入）。
-
----
-
-## 配置说明
-
-### 1）环境变量文件
-
-将 `.env.example` 复制为 `.env`，按需填写以下关键项：
-
-- `DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD`
-- `REDIS_URL`
-- `EXCHANGE_NAME`（默认 `binance_um`）
-- `BINANCE_API_KEY / BINANCE_API_SECRET / BINANCE_BASE_URL`
-- `SYMBOLS`（例如：`BTCUSDT,ETHUSDT`）
-- `TIMEFRAME`（默认 `15m`）
-- `ENABLE_TRADING`（`true/false`）
-- `PAPER_TRADING`（`true/false`）
-- `ADMIN_BEARER_TOKEN`（api-service 管理接口鉴权）
-
-### 2）数据库自动迁移（非常重要）
-
-所有服务启动时都会自动执行 SQL 迁移（幂等）：
-
-- 用于创建/升级数据库表结构
-- 已执行过的迁移会被记录，重复启动不会重复执行同一迁移文件
-
----
-
-## 启动方式
-
-### 1）构建并启动
+1) 复制环境变量模板并修改：
 
 ```bash
-docker compose up -d --build
+cp .env.example .env
 ```
 
-### 2）查看服务日志（示例）
+2) 启动：
 
 ```bash
-docker logs -f asv8_strategy_engine
-docker logs -f asv8_data_syncer
-docker logs -f asv8_api_service
+docker compose up --build
 ```
 
+3) 检查健康：
+
+- API：`http://localhost:8080/health`
+- Metrics：`http://localhost:8080/metrics`
+
 ---
 
-## 管理接口（api-service）
+## 2. 运行时选择交易所（二选一）
 
-### 接口列表
+在 `.env` 中设置：
 
-- `GET /health`：查看三服务健康状态（基于心跳/状态汇总）
-- `GET /metrics`：Prometheus 指标输出
-- `POST /admin/update_config`：热更新系统参数（写入 system_config 并审计）
-- `POST /admin/emergency_exit`：一键清仓并停止开仓（写入控制指令，由策略引擎执行）
-- `POST /admin/halt`：停止开仓（不影响已持仓的减仓/平仓）
-- `POST /admin/resume`：恢复开仓
-- `GET /admin/status`：查看权益、持仓、最近订单、风控状态等摘要
+- `EXCHANGE=binance` 或 `EXCHANGE=bybit`（或 `paper`）
+- 若 `binance`：提供 `BINANCE_API_KEY/BINANCE_API_SECRET`
+- 若 `bybit`：提供 `BYBIT_API_KEY/BYBIT_API_SECRET`
 
-### 鉴权方式
+本项目在正常运行模式下 **只会选择一个交易所客户端**，不会同时调用多个交易所。
 
-所有 `/admin/*` 接口都需要请求头：
+---
 
-```text
-Authorization: Bearer <ADMIN_BEARER_TOKEN>
+## 3. 项目结构（简述）
+
+- `shared/`：公共库（配置、日志、DB、Redis 锁、交易所网关、领域模型、指标与 Telegram）
+- `services/`：三个服务
+- `tools/admin_cli/`：命令行管理工具（可替代或补充 /admin）
+- `migrations/`：MariaDB 初始化与升级脚本（自动执行）
+
+---
+
+## 4. 重要约定（强制）
+
+- **时区**：调度按 `Asia/Hong_Kong` 计算 tick；DB 存储时间统一用 UTC。
+- **幂等**：所有下单都必须携带 `client_order_id`（Binance: `newClientOrderId` / Bybit: `orderLinkId`）。
+- **事件流**：订单生命周期必须写入 `order_events`，用于审计/恢复/对账。
+- **止损一致性**：触发止损必须写事件并 Telegram 通知（带 `trace_id` 与 `reason_code`）。
+
+---
+
+## 5. 常用管理接口
+
+API 服务：`http://localhost:8080`
+
+- `POST /admin/halt`  （暂停策略下单）
+- `POST /admin/resume`（恢复策略下单）
+- `POST /admin/emergency_exit`（紧急平仓/卖出）
+- `POST /admin/update_config`（写 system_config，带审计）
+
+认证：`Authorization: Bearer <ADMIN_TOKEN>`
+
+---
+
+## 6. Admin CLI（可选）
+
+```bash
+python -m tools.admin_cli status
+python -m tools.admin_cli halt --reason "maintenance"
+python -m tools.admin_cli resume --reason "ok"
 ```
 
----
-
-## 数据与审计（核心表）
-
-系统会使用以下表实现审计与可回放：
-
-- `order_events`：订单全生命周期事件流（不可变，含交易所原始回包脱敏存证）
-- `position_snapshots`：持仓快照（每 5 分钟 + 关键事件触发）
-- `trade_logs`：交易日志（用于统计与 AI 训练标签）
-- `market_data`：原始 K 线数据（清洗后落库）
-- `market_data_cache`：预计算特征缓存（ADX/EMA/Squeeze/Vol_Ratio 等）
-- `service_status`：服务心跳与状态
-- `control_commands`：控制指令（HALT/RESUME/EMERGENCY_EXIT/UPDATE_CONFIG）
-- `system_config`：热更新配置
-- `config_audit`：配置变更审计
-- `ai_models`：AI 模型版本与二进制存储
+> CLI 会直接读写 MariaDB（等价于调用 /admin 的写入路径），同样会写审计与可选 Telegram。
 
 ---
 
-## 运行建议
+## 7. 开发说明
 
-### 1）建议先纸面验证（强烈建议）
-
-首次运行建议：
-
-- `PAPER_TRADING=true`
-- `ENABLE_TRADING=true`
-
-待逻辑与审计链路验证完成后，再切换为实盘。
-
-### 2）风控与自愈说明
-
-- 策略引擎下单前执行硬风控校验：保证金地板、强平距离、风险预算（3%）等
-- 发生连续失败/异常行情/回撤阈值等情况会触发停开仓（HALT），并通过告警通知
-- 服务异常可通过容器重启恢复；数据同步与策略执行隔离（B-lite 的关键优势）
-
----
-
-## 重要说明
-
-- 本项目重点在“工程可长期运行”：幂等、审计、可观测性、自愈与可回放。
-- 交易有风险，任何策略与系统都不保证盈利。请在可承受风险范围内使用。
+- 本仓库使用 `requirements.txt` 以降低环境复杂度。
+- 每个模块都有较详细注释，便于你后续扩展策略/AI/回测。
