@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -9,155 +8,94 @@ from shared.config import Settings
 from shared.db import MariaDB, migrate
 from shared.exchange import make_exchange
 from shared.logging import get_logger, new_trace_id
+from shared.redis import distributed_lock, redis_client
 from shared.telemetry import Metrics, Telegram
-from shared.domain.time import now_ms
+from shared.models.market_cache import MarketDataCacheRepo
+from shared.models.market_repo import MarketDataRepo
+from shared.models.service_status_repo import ServiceStatusRepo
+from shared.strategy.indicators import compute_indicators_for_series
 
 SERVICE = "data-syncer"
+VERSION = "0.1.0"
 logger = get_logger(SERVICE, os.getenv("LOG_LEVEL", "INFO"))
 
-def compute_ema(prev: float, price: float, period: int) -> float:
-    k = 2 / (period + 1)
-    return price * k + prev * (1 - k)
 
-def compute_rsi(closes, period: int = 14):
-    if len(closes) < period + 1:
-        return None
-    gains = 0.0
-    losses = 0.0
-    for i in range(-period, 0):
-        diff = closes[i] - closes[i-1]
-        if diff >= 0:
-            gains += diff
-        else:
-            losses -= diff
-    if losses == 0:
-        return 100.0
-    rs = gains / losses
-    return 100 - (100 / (1 + rs))
+def tg_alert(telegram: Telegram, *, level: str, event: str, title: str, trace_id: str, exchange: str, symbol: str, summary_extra: dict, payload_extra: dict) -> None:
+    summary_kv = {
+        "level": level,
+        "event": event,
+        "service": "行情同步",
+        "trace_id": trace_id,
+        "exchange": exchange,  # 保持默认
+        "symbol": symbol,      # 保持默认
+        **(summary_extra or {}),
+    }
+    payload = {
+        "level": level,
+        "event": event,
+        "service": "data-syncer",
+        "trace_id": trace_id,
+        "exchange": exchange,
+        "symbol": symbol,
+        **(payload_extra or {}),
+    }
+    telegram.send_alert_zh(title=title, summary_kv=summary_kv, payload=payload)
 
-def upsert_heartbeat(db: MariaDB, instance_id: str, status: dict):
-    db.execute(
-        """
-        INSERT INTO service_status(service_name, instance_id, last_heartbeat, status_json)
-        VALUES (%s,%s, CURRENT_TIMESTAMP, %s)
-        ON DUPLICATE KEY UPDATE last_heartbeat=CURRENT_TIMESTAMP, status_json=VALUES(status_json)
-        """,
-        (SERVICE, instance_id, __import__("json").dumps(status, ensure_ascii=False)),
-    )
 
-def main():
+def main() -> None:
     settings = Settings()
+    telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
+    metrics = Metrics(service=SERVICE, instance=settings.instance_id)
+
     db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
     migrate(db, Path("/app/migrations"))
 
-    metrics = Metrics(SERVICE)
-    telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
-    ex = make_exchange(settings, metrics=metrics, service_name=SERVICE)
+    r = redis_client(settings.redis_url)
 
-    instance_id = f"{SERVICE}-{os.getpid()}"
-    ema_fast = None
-    ema_slow = None
+    market_repo = MarketDataRepo(db)
+    cache_repo = MarketDataCacheRepo(db)
+    svc_repo = ServiceStatusRepo(db)
 
-    last_cache = db.fetch_one(
-        """
-        SELECT ema_fast, ema_slow FROM market_data_cache
-        WHERE symbol=%s AND interval_minutes=%s
-        ORDER BY open_time_ms DESC LIMIT 1
-        """,
-        (settings.symbol, settings.interval_minutes),
-    )
-    if last_cache:
-        ema_fast = float(last_cache["ema_fast"]) if last_cache["ema_fast"] is not None else None
-        ema_slow = float(last_cache["ema_slow"]) if last_cache["ema_slow"] is not None else None
+    ex = make_exchange(settings)
 
     while True:
         trace_id = new_trace_id("sync")
         try:
-            last = db.fetch_one(
-                """
-                SELECT open_time_ms FROM market_data
-                WHERE symbol=%s AND interval_minutes=%s
-                ORDER BY open_time_ms DESC LIMIT 1
-                """,
-                (settings.symbol, settings.interval_minutes),
-            )
-            start_ms = int(last["open_time_ms"]) + settings.interval_minutes * 60_000 if last else None
+            with distributed_lock(r, key=f"lock:{SERVICE}:{settings.symbol}", ttl_seconds=25):
+                svc_repo.heartbeat(service_name=SERVICE, instance_id=settings.instance_id)
 
-            klines = ex.fetch_klines(symbol=settings.symbol, interval_minutes=settings.interval_minutes, start_ms=start_ms, limit=1000)
+                candles = ex.fetch_klines(symbol=settings.symbol, interval_minutes=settings.interval_minutes, limit=300)
+                if not candles:
+                    time.sleep(settings.data_sync_interval_seconds)
+                    continue
 
-            if not klines:
-                upsert_heartbeat(db, instance_id, {"trace_id": trace_id, "status": "NO_DATA"})
-                time.sleep(10)
-                continue
+                market_repo.upsert_candles(symbol=settings.symbol, interval_minutes=settings.interval_minutes, candles=candles)
 
-            recent = db.fetch_all(
-                """
-                SELECT close_price FROM market_data
-                WHERE symbol=%s AND interval_minutes=%s
-                ORDER BY open_time_ms DESC LIMIT 100
-                """,
-                (settings.symbol, settings.interval_minutes),
-            )
-            closes = [float(r["close_price"]) for r in reversed(recent)]
+                series = market_repo.get_latest_series(symbol=settings.symbol, interval_minutes=settings.interval_minutes, limit=300)
+                ind = compute_indicators_for_series(series)
 
-            md_rows = []
-            cache_rows = []
-            for k in klines:
-                md_rows.append((settings.symbol, settings.interval_minutes, k.open_time_ms, k.close_time_ms, k.open, k.high, k.low, k.close, k.volume))
-                closes.append(float(k.close))
-                if ema_fast is None:
-                    ema_fast = float(k.close)
-                else:
-                    ema_fast = compute_ema(ema_fast, float(k.close), 7)
-                if ema_slow is None:
-                    ema_slow = float(k.close)
-                else:
-                    ema_slow = compute_ema(ema_slow, float(k.close), 25)
+                cache_repo.upsert_latest(symbol=settings.symbol, interval_minutes=settings.interval_minutes, snapshot=ind)
 
-                rsi = compute_rsi(closes, 14)
-                cache_rows.append((settings.symbol, settings.interval_minutes, k.open_time_ms, ema_fast, ema_slow, rsi))
+                ex.update_last_price(symbol=settings.symbol, price=float(ind["close_price"]))
 
-            with db.tx() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO market_data(
-                      symbol, interval_minutes, open_time_ms, close_time_ms,
-                      open_price, high_price, low_price, close_price, volume
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                      close_time_ms=VALUES(close_time_ms),
-                      open_price=VALUES(open_price),
-                      high_price=VALUES(high_price),
-                      low_price=VALUES(low_price),
-                      close_price=VALUES(close_price),
-                      volume=VALUES(volume)
-                    """,
-                    md_rows,
-                )
-                cur.executemany(
-                    """
-                    INSERT INTO market_data_cache(symbol, interval_minutes, open_time_ms, ema_fast, ema_slow, rsi)
-                    VALUES (%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                      ema_fast=VALUES(ema_fast),
-                      ema_slow=VALUES(ema_slow),
-                      rsi=VALUES(rsi)
-                    """,
-                    cache_rows,
-                )
+                metrics.counter("sync_ok_total").inc()
+                time.sleep(settings.data_sync_interval_seconds)
 
-            if hasattr(ex, "update_last_price"):
-                ex.update_last_price(settings.symbol, float(klines[-1].close))
-
-            lag = max(0, now_ms() - klines[-1].close_time_ms)
-            metrics.data_sync_lag_ms.labels(SERVICE, settings.symbol, str(settings.interval_minutes)).set(lag)
-            upsert_heartbeat(db, instance_id, {"trace_id": trace_id, "status": "OK", "inserted": len(md_rows), "lag_ms": lag})
         except Exception as e:
-            telegram.send(f"[{SERVICE}] ERROR trace_id={trace_id} err={e}")
-            upsert_heartbeat(db, instance_id, {"trace_id": trace_id, "status": "ERROR", "error": str(e)[:400]})
-            time.sleep(5)
+            logger.exception("data-syncer loop error trace_id=%s", trace_id)
+            tg_alert(
+                telegram,
+                level="ERROR",
+                event="DATA_SYNC_ERROR",
+                title=f"❌ 行情同步错误 {settings.symbol}",
+                trace_id=trace_id,
+                exchange=settings.exchange,
+                symbol=settings.symbol,
+                summary_extra={"错误": str(e)[:200]},
+                payload_extra={"reason_code": "DATA_SYNC", "error": str(e)},
+            )
+            time.sleep(2.0)
 
-        time.sleep(10)
 
 if __name__ == "__main__":
     main()
