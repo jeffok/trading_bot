@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -29,6 +29,7 @@ class AdminMeta(BaseModel):
     actor: str = Field(..., min_length=1, max_length=64, description="操作人/来源（必须）")
     reason_code: str = Field(..., min_length=1, max_length=64, description="原因代码（必须）")
     reason: str = Field(..., min_length=1, max_length=4096, description="原因说明（必须）")
+    confirm_code: Optional[str] = Field(default=None, max_length=128, description="二次确认码（可选，开启时必填）")
 
 
 class AdminUpdateConfig(AdminMeta):
@@ -51,6 +52,16 @@ def expected_reason_code(cmd_reason_code: str, expected: str) -> None:
     # 强制 reason_code 标准化，避免审计数据碎片化
     if cmd_reason_code != expected:
         raise HTTPException(status_code=400, detail=f"reason_code must be '{expected}'")
+
+
+def require_confirm(cmd: AdminMeta, settings: Settings) -> None:
+    if not settings.admin_confirm_required:
+        return
+    if not settings.admin_confirm_code:
+        raise HTTPException(status_code=500, detail="ADMIN_CONFIRM_REQUIRED is enabled but ADMIN_CONFIRM_CODE is empty")
+    if not cmd.confirm_code or cmd.confirm_code != settings.admin_confirm_code:
+        raise HTTPException(status_code=400, detail="confirm_code required")
+
 
 
 
@@ -160,12 +171,23 @@ def get_db(settings: Settings = Depends(get_settings)) -> MariaDB:
     return MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
 
 
-def require_admin(authorization: str = Header(default=""), settings: Settings = Depends(get_settings)) -> None:
+def require_admin(request: Request, authorization: str = Header(default=""), settings: Settings = Depends(get_settings)) -> None:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = authorization.split(" ", 1)[1].strip()
-    if token != settings.admin_token:
+    if token not in set(settings.admin_tokens):
         raise HTTPException(status_code=403, detail="Invalid token")
+
+    # IP allowlist (optional)
+    if settings.admin_ip_allowlist:
+        xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+        client_ip = ""
+        if xff:
+            client_ip = xff.split(",", 1)[0].strip()
+        elif request.client:
+            client_ip = request.client.host or ""
+        if not is_ip_allowed(client_ip, settings.admin_ip_allowlist):
+            raise HTTPException(status_code=403, detail="IP not allowed")
 
 
 @app.get("/health")
@@ -292,6 +314,11 @@ def admin_status(
         "positions": positions,
         "data_lag": data_lag,
         "services": services,
+        "security": {
+            "admin_ip_allowlist_enabled": bool(settings.admin_ip_allowlist),
+            "admin_confirm_required": bool(settings.admin_confirm_required),
+            "leader_election_enabled": bool(settings.leader_election_enabled),
+        },
     }
 
 @app.post("/admin/halt")
@@ -369,6 +396,7 @@ def admin_emergency_exit(
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("exit")
     expected_reason_code(cmd.reason_code, "EMERGENCY_EXIT")
+    require_confirm(cmd, settings)
     reason = cmd.reason
 
     write_system_config(
@@ -402,6 +430,7 @@ def admin_update_config(
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("cfg")
     expected_reason_code(cmd.reason_code, "ADMIN_UPDATE_CONFIG")
+    require_confirm(cmd, settings)
     key = cmd.key.strip()
     value = cmd.value
     reason = cmd.reason

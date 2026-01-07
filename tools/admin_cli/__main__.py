@@ -113,6 +113,15 @@ def _dict_row(row: Any) -> Dict[str, Any]:
         return {}
 
 
+def require_confirm_cli(settings: Settings, confirm_code: str | None) -> None:
+    if not getattr(settings, "admin_confirm_required", False):
+        return
+    if not getattr(settings, "admin_confirm_code", ""):
+        raise SystemExit("ADMIN_CONFIRM_REQUIRED enabled but ADMIN_CONFIRM_CODE is empty")
+    if not confirm_code or confirm_code != settings.admin_confirm_code:
+        raise SystemExit("confirm_code required (ADMIN_CONFIRM_REQUIRED=true)")
+
+
 def _calc_cache_age_seconds(row: Dict[str, Any], interval_minutes: int) -> Optional[int]:
     """
     计算 cache 最新记录的“年龄（秒）”
@@ -448,6 +457,8 @@ def main() -> None:
     p_exit.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
     p_exit.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 EMERGENCY_EXIT）")
     p_exit.add_argument("--reason", required=True, help="原因说明")
+    p_exit.add_argument("--confirm-code", dest="confirm_code", required=False,
+                        help="二次确认码（若启用 ADMIN_CONFIRM_REQUIRED）")
 
     p_set = sub.add_parser("set", help="写入 system_config（等价于 /admin/update_config）")
     p_set.add_argument("key", type=str, help="配置键")
@@ -480,6 +491,7 @@ def main() -> None:
 
     if args.cmd == "set":
         expected_reason_code(args.reason_code, "ADMIN_UPDATE_CONFIG")
+        require_confirm_cli(settings, getattr(args, "confirm_code", None))
         write_system_config(
             db,
             actor=args.by,
@@ -625,6 +637,7 @@ def main() -> None:
 
     if args.cmd == "emergency-exit":
         expected_reason_code(args.reason_code, "EMERGENCY_EXIT")
+        require_confirm_cli(settings, getattr(args, "confirm_code", None))
         write_system_config(
             db,
             actor=args.by,

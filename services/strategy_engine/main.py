@@ -222,6 +222,8 @@ def _load_ai_model(db: MariaDB, settings: Settings) -> OnlineLogisticRegression:
             return OnlineLogisticRegression.from_dict(json.loads(raw), fallback_dim=dim)
         except Exception:
             pass
+
+
     return OnlineLogisticRegression(dim=dim, lr=float(settings.ai_lr), l2=float(settings.ai_l2))
 
 
@@ -521,14 +523,39 @@ def main():
     r = redis_client(settings.redis_url)
 
     instance_id = get_instance_id(settings.instance_id)
+    leader_key = f"{settings.leader_key_prefix}:{SERVICE}"
+    elector = LeaderElector(
+        r,
+        key=leader_key,
+        instance_id=instance_id,
+        ttl_seconds=settings.leader_ttl_seconds,
+        renew_interval_seconds=settings.leader_renew_interval_seconds,
+    )
+    last_role: str = "unknown"
+
     ex = make_exchange(settings, metrics=metrics, service_name=SERVICE)
 
     while True:
+        # leader election: only leader executes trading ticks; followers only heartbeat + metrics
+        is_leader = True
+        if settings.leader_election_enabled:
+            is_leader = elector.ensure()
+        metrics.leader_is_leader.labels(SERVICE, instance_id).set(1 if is_leader else 0)
+
+        role = "leader" if is_leader else "follower"
+        if role != last_role:
+            metrics.leader_changes_total.labels(SERVICE, instance_id, role).inc()
+            last_role = role
+
         # heartbeat (liveness)
         try:
-            upsert_service_status(db, service_name=SERVICE, instance_id=instance_id, status={"status": "RUNNING"})
+            upsert_service_status(db, service_name=SERVICE, instance_id=instance_id, status={"status": "RUNNING", "role": role, "leader": elector.get_leader() if settings.leader_election_enabled else instance_id})
         except Exception:
             pass
+
+        if not is_leader:
+            time.sleep(settings.leader_follower_sleep_seconds)
+            continue
 
         time.sleep(next_tick_sleep_seconds(settings.strategy_tick_seconds))
         trace_id = new_trace_id("tick")

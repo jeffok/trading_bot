@@ -13,6 +13,19 @@ class Metrics:
     def __init__(self, service: str):
         self.service = service
 
+        # Leader election (HA)
+        self.leader_is_leader = Gauge(
+            "leader_is_leader",
+            "Whether this instance is the leader (1 leader, 0 follower)",
+            ("service", "instance_id"),
+        )
+        self.leader_changes_total = Counter(
+            "leader_changes_total",
+            "Leadership role changes",
+            ("service", "instance_id", "role"),
+        )
+
+
         # Trading / orders
         self.orders_total = Counter(
             "orders_total",

@@ -11,6 +11,9 @@ from shared.config import Settings
 from shared.db import MariaDB, migrate
 from shared.exchange import make_exchange
 from shared.logging import get_logger, new_trace_id
+from shared.redis import LeaderElector, redis_client
+from shared.domain.heartbeat import upsert_service_status
+from shared.domain.instance import get_instance_id
 from shared.telemetry import Metrics, Telegram, start_metrics_http_server
 from shared.domain.time import now_ms, HK
 
@@ -628,7 +631,18 @@ def main():
 
     ex = make_exchange(settings, metrics=metrics, service_name=SERVICE)
 
-    instance_id = settings.instance_id or f"{os.getenv('HOSTNAME', 'host')}:{os.getpid()}"
+    instance_id = get_instance_id(settings.instance_id)
+
+    r = redis_client(settings.redis_url)
+    leader_key = f"{settings.leader_key_prefix}:{SERVICE}"
+    elector = LeaderElector(
+        r,
+        key=leader_key,
+        instance_id=instance_id,
+        ttl_seconds=settings.leader_ttl_seconds,
+        renew_interval_seconds=settings.leader_renew_interval_seconds,
+    )
+    last_role: str = "unknown"
 
     symbols = list(settings.symbols) if getattr(settings, "symbols", None) else [settings.symbol]
     # safety: de-dupe
@@ -637,6 +651,34 @@ def main():
     logger.info(f"start service={SERVICE} exchange={settings.exchange} interval={settings.interval_minutes} symbols={symbols}")
 
     while True:
+        # leader election: only leader performs sync/archive/precompute
+        is_leader = True
+        if settings.leader_election_enabled:
+            is_leader = elector.ensure()
+        metrics.leader_is_leader.labels(SERVICE, instance_id).set(1 if is_leader else 0)
+
+        role = "leader" if is_leader else "follower"
+        if role != last_role:
+            metrics.leader_changes_total.labels(SERVICE, instance_id, role).inc()
+            last_role = role
+
+        # heartbeat
+        try:
+            upsert_service_status(
+                db,
+                service_name=SERVICE,
+                instance_id=instance_id,
+                trace_id=new_trace_id("hb"),
+                status=role,
+                extra={"leader": elector.get_leader() if settings.leader_election_enabled else instance_id},
+            )
+        except Exception:
+            pass
+
+        if not is_leader:
+            time.sleep(settings.leader_follower_sleep_seconds)
+            continue
+
         metrics.data_sync_cycles_total.labels(SERVICE).inc()
         # daily archive
         run_daily_archive(db, settings, metrics, instance_id=instance_id)
