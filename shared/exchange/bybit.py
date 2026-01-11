@@ -224,6 +224,14 @@ class BybitV5LinearClient(ExchangeClient):
     # 下单
     # -------------------------
     def place_market_order(self, *, symbol: str, side: str, qty: float, client_order_id: str) -> OrderResult:
+        """下市价单（Market）。
+
+        返回：
+        - exchange_order_id：交易所订单号
+        - status：订单状态（尽量返回交易所原始状态字符串）
+        - filled_qty / avg_price：尽量从订单回报/查询中获取真实成交数据
+        - fee_usdt / pnl_usdt：Bybit 只能在平仓（SELL）时较稳定从 closed-pnl 查询到净盈亏；开仓 BUY 通常仅能拿到手续费（若可获取）
+        """
         side_u = side.upper()
         if side_u not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side={side}")
@@ -248,77 +256,61 @@ class BybitV5LinearClient(ExchangeClient):
         if self.position_idx:
             payload["positionIdx"] = int(self.position_idx)
 
-        data = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="account")
-        result = (data or {}).get("result") or {}
+        data_create = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="order")
+        result = (data_create or {}).get("result") or {}
         order_id = str(result.get("orderId", ""))
 
-        # 创建后立即轮询状态
+        # 创建后立即轮询状态（短轮询 10s，确保拿到 FILLED/最终态）
         status = "NEW"
         filled_qty = 0.0
-        end = time.time() + 10
+        avg_price: Optional[float] = None
+        fee_usdt: Optional[float] = None
+        pnl_usdt: Optional[float] = None
+
+        end = time.time() + 10.0
         last_status: Optional[OrderResult] = None
         while time.time() < end:
             st = self.get_order_status(symbol=symbol, client_order_id=client_order_id, exchange_order_id=order_id)
             last_status = st
-            status = st.status
-            filled_qty = st.filled_qty
-            if status.upper() in ("FILLED", "CANCELED", "CANCELLED", "REJECTED"):
+            status = str(st.status or status)
+            filled_qty = float(st.filled_qty or 0.0)
+            if st.avg_price is not None:
+                avg_price = st.avg_price
+            # Bybit 订单查询里通常有 cumExecFee
+            try:
+                if st.raw and isinstance(st.raw, dict):
+                    o = (((st.raw.get("result") or {}).get("list") or [{}])[0]) or {}
+                    cf = o.get("cumExecFee")
+                    if cf not in (None, "", "0", 0):
+                        fee_usdt = float(cf)
+            except Exception:
+                pass
+
+            if str(status).upper() in ("FILLED", "CANCELED", "CANCELLED", "REJECTED"):
                 break
             time.sleep(0.2)
 
-        # 真实手续费/真实 pnl（仅 SELL 平仓才会有 closedPnl）
-        fee_usdt, pnl_usdt = self._fetch_closed_pnl(symbol=symbol, order_id=order_id, side=side_u)
+        # 平仓 SELL：尽量从 closed-pnl 获取真实净盈亏与手续费（更可靠）
+        fee2, pnl2 = self._fetch_closed_pnl(symbol=symbol, order_id=order_id, side=side_u)
+        if fee2 is not None:
+            fee_usdt = fee2
+        if pnl2 is not None:
+            pnl_usdt = pnl2
 
-        # 尝试取 avgPrice
-        avg_price = None
-        if last_status and isinstance(last_status.raw, dict):
-            try:
-                o = (((last_status.raw.get("result") or {}).get("list") or [{}])[0])
-                ap = o.get("avgPrice")
-                if ap not in (None, "", "0", 0):
-                    avg_price = float(ap)
-            except Exception:
-                avg_price = None
-
-        avg_price = None
-
-        try:
-
-            avg_price = float(o.get("avgPrice", 0) or 0.0) or None
-
-        except Exception:
-
-            avg_price = None
-
-        if avg_price is None and filled_qty > 0:
-
-            try:
-
-                cum_value = float(o.get("cumExecValue", 0) or 0.0)
-
-                avg_price = (cum_value / filled_qty) if cum_value > 0 else None
-
-            except Exception:
-
-                avg_price = None
-
-
+        raw_status = last_status.raw if last_status and isinstance(last_status.raw, dict) else {}
         return OrderResult(
-
-            exchange_order_id=str(o.get("orderId", exchange_order_id or "")),
-
+            exchange_order_id=order_id,
             status=status,
-
             filled_qty=filled_qty,
-
             avg_price=avg_price,
-
-            raw=data,
-
+            fee_usdt=fee_usdt,
+            pnl_usdt=pnl_usdt,
+            raw={"create": data_create, "status": raw_status},
         )
 
     # -------------------------
     # 平仓结算 -> closedPnl（净值，含手续费影响）
+    # -------------------------
     # -------------------------
     def _fetch_closed_pnl(self, *, symbol: str, order_id: str, side: str) -> Tuple[Optional[float], Optional[float]]:
         """返回 (fee_usdt, pnl_usdt)。只在 SELL（平仓）时返回 pnl。"""
@@ -421,3 +413,63 @@ class BybitV5LinearClient(ExchangeClient):
             return True
         except Exception:
             return False
+
+
+    def get_order_status(self, *, symbol: str, client_order_id: str, exchange_order_id: Optional[str]) -> OrderResult:
+        """查询订单状态（Bybit V5）。
+
+        规则：
+        - 优先 realtime（近期/活动订单）
+        - realtime 查不到时 fallback history（已归档订单）
+        """
+        params: Dict[str, Any] = {"category": "linear", "symbol": symbol}
+        if exchange_order_id:
+            params["orderId"] = exchange_order_id
+        else:
+            params["orderLinkId"] = client_order_id
+
+        data = self._request("GET", "/v5/order/realtime", params=params, signed=True, budget="order")
+        o: Dict[str, Any] = {}
+        try:
+            o = (((data.get("result") or {}).get("list") or [{}])[0]) or {}
+        except Exception:
+            o = {}
+
+        if not o or not o.get("orderId"):
+            data2 = self._request("GET", "/v5/order/history", params=params, signed=True, budget="order")
+            try:
+                o = (((data2.get("result") or {}).get("list") or [{}])[0]) or {}
+                data = data2
+            except Exception:
+                o = {}
+
+        status = str(o.get("orderStatus") or o.get("order_status") or "UNKNOWN")
+        filled_qty = 0.0
+        try:
+            filled_qty = float(o.get("cumExecQty", 0.0) or 0.0)
+        except Exception:
+            filled_qty = 0.0
+
+        avg_price: Optional[float] = None
+        try:
+            ap = o.get("avgPrice")
+            if ap not in (None, "", "0", 0):
+                avg_price = float(ap)
+        except Exception:
+            avg_price = None
+
+        # fallback: cumExecValue / cumExecQty
+        if avg_price is None and filled_qty > 0:
+            try:
+                cum_value = float(o.get("cumExecValue", 0) or 0.0)
+                avg_price = (cum_value / filled_qty) if cum_value > 0 else None
+            except Exception:
+                avg_price = None
+
+        return OrderResult(
+            exchange_order_id=str(o.get("orderId") or exchange_order_id or ""),
+            status=status,
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            raw=data if isinstance(data, dict) else {"raw": str(data)},
+        )

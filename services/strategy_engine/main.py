@@ -431,6 +431,39 @@ def _arm_protective_stop_with_retry(
             except Exception:
                 pass
 
+            # Telegram：保护止损单挂单成功（让你能确认“止损保护已经存在”）
+            try:
+                summary_kv = build_trade_summary(
+                    event="STOP_ARMED",
+                    trace_id=trace_id,
+                    exchange=exchange.name,
+                    symbol=symbol,
+                    side="SELL",
+                    qty=qty,
+                    stop_price=stop_price,
+                    reason_code=ReasonCode.STOP_LOSS_ARMED if action == "ARM" else ReasonCode.STOP_LOSS_REARMED,
+                    reason="Protective stop-market order armed" if action == "ARM" else "Protective stop-market order re-armed",
+                    stop_client_order_id=stop_client_order_id,
+                    stop_exchange_order_id=stop_exchange_order_id,
+                    status=str(res.status or "CREATED"),
+                    extra={"seq": seq, "attempt": attempt},
+                )
+                send_trade_alert(
+                    telegram,
+                    title="保护止损单已挂单",
+                    summary_kv=summary_kv,
+                    payload={
+                        "symbol": symbol,
+                        "qty": float(qty),
+                        "stop_price": float(stop_price),
+                        "stop_client_order_id": stop_client_order_id,
+                        "stop_exchange_order_id": stop_exchange_order_id,
+                        "raw": res.raw or {},
+                    },
+                )
+            except Exception:
+                pass
+
             return (stop_client_order_id, stop_exchange_order_id)
 
         except RateLimitError as e:
@@ -1875,6 +1908,57 @@ def main():
                             meta["base_qty"] = float(base_qty)
                             if runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get("stop_client_order_id"):
                                 _cancel_protective_stop(exchange=ex, db=db, symbol=symbol, trace_id=trace_id, meta=meta)
+                            send_system_alert(
+                                telegram,
+                                title="紧急退出下单已提交",
+                                summary_kv=build_system_summary(
+                                    event="EMERGENCY_EXIT_SUBMITTED",
+                                    trace_id=trace_id,
+                                    exchange=exchange,
+                                    level="WARN",
+                                    extra={
+                                        "symbol": symbol,
+                                        "side": "SELL",
+                                        "qty": float(base_qty),
+                                        "last_price": float(last_price),
+                                        "client_order_id": client_order_id,
+                                    },
+                                ),
+                                payload={
+                                    "symbol": symbol,
+                                    "side": "SELL",
+                                    "qty": float(base_qty),
+                                    "last_price": float(last_price),
+                                    "client_order_id": client_order_id,
+                                },
+                            )
+                            summary_kv = build_trade_summary(
+                                event="STOP_LOSS_SUBMITTED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="SELL",
+                                qty=base_qty,
+                                price=last_price,
+                                stop_price=stop_price,
+                                reason_code=ReasonCode.STOP_LOSS,
+                                reason=f"Hard stop loss submit: last={last_price} <= stop={stop_price}",
+                                client_order_id=client_order_id,
+                                status="SUBMITTING",
+                            )
+                            send_trade_alert(
+                                telegram,
+                                title="止损下单已提交",
+                                summary_kv=summary_kv,
+                                payload={
+                                    "client_order_id": client_order_id,
+                                    "symbol": symbol,
+                                    "side": "SELL",
+                                    "qty": float(base_qty),
+                                    "last_price": float(last_price),
+                                    "stop_price": float(stop_price),
+                                },
+                            )
                             res = ex.place_market_order(symbol=symbol, side="SELL", qty=base_qty, client_order_id=client_order_id)
                             append_order_event(
                                 db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
@@ -2191,6 +2275,41 @@ def main():
                                 "last_price": last_price,
                             }
                         )
+                        # Telegram：下单已提交（避免只在成交后才告警，导致不知道是否已经挂/成交）
+                        summary_kv = build_trade_summary(
+                            event="BUY_SUBMITTED",
+                            trace_id=trace_id,
+                            exchange=exchange,
+                            symbol=symbol,
+                            side="BUY",
+                            qty=qty,
+                            price=last_price,
+                            leverage=lev,
+                            ai_score=ai_score,
+                            stop_price=stop_price_init,
+                            stop_dist_pct=stop_dist_pct,
+                            reason_code=open_reason_code,
+                            reason=open_reason,
+                            client_order_id=client_order_id,
+                            status="SUBMITTING",
+                            extra={"trade_id": trade_id},
+                        )
+                        send_trade_alert(
+                            telegram,
+                            title="开仓下单已提交",
+                            summary_kv=summary_kv,
+                            payload={
+                                "client_order_id": client_order_id,
+                                "symbol": symbol,
+                                "side": "BUY",
+                                "qty": float(qty),
+                                "last_price": float(last_price),
+                                "expected_stop_price": float(stop_price_init),
+                                "leverage": int(lev),
+                                "reason_code": open_reason_code.value if hasattr(open_reason_code, "value") else str(open_reason_code),
+                                "reason": open_reason,
+                            },
+                        )
                         res = ex.place_market_order(symbol=symbol, side="BUY", qty=qty, client_order_id=client_order_id)
                         append_order_event(
                             db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
@@ -2399,6 +2518,35 @@ def main():
                             reason_code=ReasonCode.STRATEGY_SIGNAL,
                             reason="Setup B SELL",
                             payload={"latest": latest, "robot_score": score, "leverage": lev}
+                        )
+                        summary_kv = build_trade_summary(
+                            event="SELL_SUBMITTED",
+                            trace_id=trace_id,
+                            exchange=exchange,
+                            symbol=symbol,
+                            side="SELL",
+                            qty=qty,
+                            price=last_price,
+                            leverage=lev,
+                            reason_code=ReasonCode.STRATEGY_EXIT,
+                            reason="Setup B SELL",
+                            client_order_id=client_order_id,
+                            status="SUBMITTING",
+                        )
+                        send_trade_alert(
+                            telegram,
+                            title="平仓下单已提交",
+                            summary_kv=summary_kv,
+                            payload={
+                                "client_order_id": client_order_id,
+                                "symbol": symbol,
+                                "side": "SELL",
+                                "qty": float(qty),
+                                "last_price": float(last_price),
+                                "leverage": int(lev),
+                                "reason_code": ReasonCode.STRATEGY_EXIT.value,
+                                "reason": "Setup B SELL",
+                            },
                         )
                         res = ex.place_market_order(symbol=symbol, side="SELL", qty=qty, client_order_id=client_order_id)
                         append_order_event(
