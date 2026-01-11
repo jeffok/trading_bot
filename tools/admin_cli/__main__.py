@@ -153,6 +153,7 @@ def _wait_for_market_cache(
         *,
         symbol: str,
         interval_minutes: int,
+        feature_version: int,
         wait_seconds: int,
         max_age_seconds: int,
 ) -> Tuple[bool, Dict[str, Any]]:
@@ -176,7 +177,7 @@ def _wait_for_market_cache(
               AND feature_version = %s
             ORDER BY open_time_ms DESC LIMIT 1
             """,
-            (symbol, interval_minutes),
+            (symbol, interval_minutes, int(feature_version)),
         )
 
         if row:
@@ -235,6 +236,7 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
             db,
             symbol=settings.symbol,
             interval_minutes=settings.interval_minutes,
+            feature_version=int(getattr(settings, 'feature_version', 1)),
             wait_seconds=wait_seconds,
             max_age_seconds=max_age_seconds,
         )
@@ -637,6 +639,7 @@ def main() -> None:
             db,
             symbol=settings.symbol,
             interval_minutes=settings.interval_minutes,
+            feature_version=int(getattr(settings, 'feature_version', 1)),
             wait_seconds=int(args.wait_seconds),
             max_age_seconds=int(args.max_age_seconds),
         )
