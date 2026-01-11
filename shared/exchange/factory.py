@@ -11,7 +11,7 @@ def make_exchange(settings, *, metrics=None, service_name: str = "unknown"):
 
     运行期：二选一（EXCHANGE=binance 或 bybit 或 paper）
     """
-    limiter = AdaptiveRateLimiter()
+    limiter = AdaptiveRateLimiter(metrics=metrics, exchange=settings.exchange.lower())
     ex = settings.exchange.lower()
 
     if ex == "binance":

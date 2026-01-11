@@ -33,6 +33,30 @@ class Metrics:
             ("service", "exchange", "symbol", "status"),
         )
 
+        self.order_e2e_latency_seconds = Histogram(
+            "order_e2e_latency_seconds",
+            "End-to-end latency from CREATED to terminal event (seconds)",
+            ("service", "exchange", "symbol", "terminal_status"),
+            buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600),
+        )
+
+        # Protective stop orders
+        self.stop_armed_total = Counter(
+            "stop_armed_total",
+            "Protective stop orders armed total",
+            ("service", "exchange", "symbol", "action"),
+        )
+        self.stop_arm_failed_total = Counter(
+            "stop_arm_failed_total",
+            "Protective stop arm/rearm failures total",
+            ("service", "exchange", "symbol", "stage"),
+        )
+        self.stop_order_invalid_total = Counter(
+            "stop_order_invalid_total",
+            "Protective stop order became invalid (canceled/rejected/expired/error)",
+            ("service", "exchange", "symbol", "status"),
+        )
+
         # Exchange I/O
         self.exchange_requests_total = Counter(
             "exchange_requests_total",
@@ -44,6 +68,46 @@ class Metrics:
             "Exchange request latency (seconds)",
             ("service", "exchange", "endpoint"),
         )
+
+        # Rate limiting / backoff
+        self.rate_limit_wait_seconds = Histogram(
+            "rate_limit_wait_seconds",
+            "Time spent waiting for limiter tokens (seconds)",
+            ("service", "exchange", "group"),
+        )
+        self.rate_limit_backoff_seconds = Histogram(
+            "rate_limit_backoff_seconds",
+            "Time spent sleeping due to 429/418 backoff (seconds)",
+            ("service", "exchange", "group"),
+        )
+        self.rate_limit_429_total = Counter(
+            "rate_limit_429_total",
+            "Rate limit responses total",
+            ("service", "exchange", "group", "status_code"),
+        )
+        self.rate_limit_retries_total = Counter(
+            "rate_limit_retries_total",
+            "Limiter retries/backoff applications total",
+            ("service", "exchange", "group"),
+        )
+
+        # Runtime config (system_config hot-reload)
+        self.runtime_config_refresh_total = Counter(
+            "runtime_config_refresh_total",
+            "Runtime config refresh total",
+            ("service",),
+        )
+        self.runtime_config_symbols_count = Gauge(
+            "runtime_config_symbols_count",
+            "Current effective symbols count",
+            ("service",),
+        )
+        self.runtime_config_last_refresh_ms = Gauge(
+            "runtime_config_last_refresh_ms",
+            "Last runtime config refresh timestamp (ms since epoch)",
+            ("service",),
+        )
+
 
         # Data sync
         self.data_sync_lag_ms = Gauge(

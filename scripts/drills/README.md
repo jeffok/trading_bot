@@ -38,3 +38,23 @@ bash scripts/drills/e2e_trade_cycle.sh
 - `bash scripts/restore_db.sh <file.sql.gz>`：从备份恢复
 
 > 需要本机/容器内可用 `mysqldump` 与 `mysql` 客户端。生产环境建议在单独维护容器或运维机上运行。
+
+
+## A2: SYMBOLS 热更新演练
+
+- 修改 system_config 的 `SYMBOLS` 并验证 `/admin/status` 的 `EFFECTIVE_SYMBOLS` 更新：
+
+```bash
+ADMIN_TOKEN=change_me ./scripts/drills/update_symbols_runtime.sh "BTCUSDT,ETHUSDT,SOLUSDT"
+```
+
+> data-syncer / strategy-engine 会在 `RUNTIME_CONFIG_REFRESH_SECONDS`（默认 30s）内拾取新 symbols。
+
+
+## B2: 保护止损运行时参数更新演练
+
+```bash
+ADMIN_TOKEN=change_me ./scripts/drills/update_stop_config_runtime.sh 3 0.5 2 60
+```
+
+> strategy-engine 会在 `RUNTIME_CONFIG_REFRESH_SECONDS`（默认 30s）内拾取新参数。

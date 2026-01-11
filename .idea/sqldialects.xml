@@ -5,5 +5,11 @@
     <file url="file://$PROJECT_DIR$/migrations/0004_create_history_tables.sql" dialect="GenericSQL" />
     <file url="file://$PROJECT_DIR$/migrations/0005_precompute_tasks_and_features.sql" dialect="GenericSQL" />
     <file url="file://$PROJECT_DIR$/migrations/0006_expand_trade_logs.sql" dialect="GenericSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/0007_protective_stop_orders.sql" dialect="GenericSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/0008_add_raw_payload_json.sql" dialect="GenericSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/0009_ai_models_is_current.sql" dialect="GenericSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/0010_feature_version_support.sql" dialect="GenericSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/0011_control_commands_audit_columns.sql" dialect="GenericSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/0012_order_events_audit_columns.sql" dialect="GenericSQL" />
   </component>
 </project>

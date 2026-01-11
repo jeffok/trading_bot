@@ -29,12 +29,13 @@ import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from shared.config import Settings
+from shared.config import Settings, load_settings
 from shared.db import MariaDB
 from shared.exchange import make_exchange
 from shared.logging import new_trace_id
 from shared.redis import redis_client
-from shared.telemetry import Telegram
+from shared.telemetry import Telegram, build_system_summary, send_system_alert, log_action
+from shared.domain.control_commands import write_control_command
 
 
 # -----------------------------
@@ -172,6 +173,7 @@ def _wait_for_market_cache(
             FROM market_data_cache
             WHERE symbol = %s
               AND interval_minutes = %s
+              AND feature_version = %s
             ORDER BY open_time_ms DESC LIMIT 1
             """,
             (symbol, interval_minutes),
@@ -258,18 +260,35 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
     # Telegram：中文文本 + JSON 摘要（send_alert_zh 内部已兜底 datetime/Decimal）
     if telegram.enabled():
         last = report["checks"].get("market_cache_last") or {}
-        telegram.send_alert_zh(
-            title="✅ Smoke Test 通过" if passed else "❌ Smoke Test 失败",
-            summary_kv={
-                "trace_id": trace_id,
-                "交易所": settings.exchange,
-                "交易对": settings.symbol,
-                "DB": "OK" if report["checks"].get("db_ping") else "FAIL",
-                "Redis": "OK" if report["checks"].get("redis_ping") else "FAIL",
-                "行情缓存": "OK" if report["checks"].get("market_cache_ok") else "FAIL",
-                "缓存延迟(秒)": last.get("age_seconds"),
+        summary_kv = build_system_summary(
+            event="SMOKE_TEST",
+            trace_id=trace_id,
+            level="INFO" if passed else "ERROR",
+            actor=args.by,
+            exchange=settings.exchange,
+            extra={
+                "symbol": settings.symbol,
+                "db": "OK" if report["checks"].get("db_ping") else "FAIL",
+                "redis": "OK" if report["checks"].get("redis_ping") else "FAIL",
+                "market_cache_ok": bool(report["checks"].get("market_cache_ok")),
+                "market_cache_age_s": report["checks"].get("market_cache_age_seconds"),
+                "market_cache_last_open_ms": (last.get("open_time_ms") if isinstance(last, dict) else None),
             },
-            payload=report,
+        )
+        send_system_alert(
+            telegram,
+            title="✅ Smoke Test 通过" if passed else "❌ Smoke Test 失败",
+            summary_kv=summary_kv,
+            payload={"report": report},
+        )
+        log_action(
+            logger,
+            action="SMOKE_TEST",
+            trace_id=trace_id,
+            reason_code="PASS" if passed else "FAIL",
+            reason="smoke test passed" if passed else "smoke test failed",
+            client_order_id=None,
+            extra={"checks": report.get("checks")},
         )
 
     # ✅ 修复：print 的 json.dumps 也要支持 Decimal/datetime
@@ -386,18 +405,22 @@ def run_e2e_trade_test(
         if telegram.enabled():
             pnl_txt = "未知" if pnl is None else f"{pnl:.2f}"
             fee_txt = "未知" if sell.fee_usdt is None else f"{sell.fee_usdt:.2f}"
-            telegram.send_alert_zh(
-                title="✅ E2E 实盘闭环测试通过" if ok else "❌ E2E 实盘闭环测试失败",
-                summary_kv={
-                    "trace_id": trace_id,
-                    "交易所": settings.exchange,
-                    "交易对": sym,
-                    "数量": q,
-                    "平仓盈亏(USDT)": pnl_txt,
-                    "手续费(USDT)": fee_txt,
-                },
-                payload=report,
+            summary_kv = build_system_summary(
+                event="E2E_TRADE_TEST",
+                trace_id=trace_id,
+                level="INFO" if ok else "ERROR",
+                actor=args.by,
+                exchange=settings.exchange,
+                extra={"symbol": sym, "qty": q, "pnl_usdt": pnl_txt, "fee_usdt": fee_txt, "ok": bool(ok)},
             )
+            send_system_alert(
+                telegram,
+                title="✅ E2E 实盘闭环测试通过" if ok else "❌ E2E 实盘闭环测试失败",
+                summary_kv=summary_kv,
+                payload={"report": report},
+            )
+            log_action(logger, action="E2E_TRADE_TEST", trace_id=trace_id, reason_code="PASS" if ok else "FAIL",
+                       reason="e2e ok" if ok else "e2e failed", client_order_id=None, extra={"symbol": sym})
 
         print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default))
         return 0 if ok else 2
@@ -405,11 +428,22 @@ def run_e2e_trade_test(
     except Exception as e:
         report["error"] = str(e)
         if telegram.enabled():
-            telegram.send_alert_zh(
-                title="❌ E2E 测试异常",
-                summary_kv={"trace_id": trace_id, "错误": str(e)},
-                payload=report,
+            summary_kv = build_system_summary(
+                event="E2E_TRADE_TEST_EXCEPTION",
+                trace_id=trace_id,
+                level="ERROR",
+                actor=args.by,
+                exchange=settings.exchange,
+                reason=str(e),
             )
+            send_system_alert(
+                telegram,
+                title="❌ E2E 测试异常",
+                summary_kv=summary_kv,
+                payload={"report": report, "error": str(e)},
+            )
+            log_action(logger, action="E2E_TRADE_TEST_EXCEPTION", trace_id=trace_id, reason_code="ERROR",
+                       reason=str(e)[:200], client_order_id=None)
         print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default), file=sys.stderr)
         return 2
 
@@ -434,7 +468,7 @@ def run_e2e_trade_test(
 # -----------------------------
 
 def main() -> None:
-    settings = Settings()
+    settings = load_settings()
 
     parser = argparse.ArgumentParser(prog="alpha-admin")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -501,13 +535,30 @@ def main() -> None:
             reason_code=args.reason_code,
             reason=args.reason,
         )
+        write_control_command(
+            db,
+            command="UPDATE_CONFIG",
+            payload={"key": args.key, "value": args.value, "actor": args.by, "reason_code": args.reason_code,
+                     "reason": args.reason, "trace_id": trace_id},
+        )
         if telegram.enabled():
-            telegram.send_alert_zh(
-                title="⚙️ 已修改配置",
-                summary_kv={"trace_id": trace_id, "key": args.key, "value": args.value, "原因": args.reason},
-                payload={"trace_id": trace_id, "key": args.key, "value": args.value, "reason_code": args.reason_code,
-                         "reason": args.reason},
+            summary_kv = build_system_summary(
+                event="UPDATE_CONFIG",
+                trace_id=trace_id,
+                level="INFO",
+                actor=args.by,
+                reason_code=args.reason_code,
+                reason=args.reason,
+                extra={"key": args.key, "value": args.value},
             )
+            send_system_alert(
+                telegram,
+                title="⚙️ 已修改配置",
+                summary_kv=summary_kv,
+                payload={"key": args.key, "value": args.value, "reason_code": args.reason_code, "reason": args.reason},
+            )
+            log_action(logger, action="UPDATE_CONFIG", trace_id=trace_id, reason_code=args.reason_code,
+                       reason=args.reason, client_order_id=None, extra={"key": args.key})
         print(f"OK trace_id={trace_id}")
         return
 
@@ -606,12 +657,29 @@ def main() -> None:
             reason_code=args.reason_code,
             reason=args.reason,
         )
+        write_control_command(
+            db,
+            command="HALT",
+            payload={"actor": args.by, "reason_code": args.reason_code, "reason": args.reason, "trace_id": trace_id},
+        )
         if telegram.enabled():
-            telegram.send_alert_zh(
-                title="⏸️ 已暂停交易",
-                summary_kv={"trace_id": trace_id, "原因": args.reason},
-                payload={"trace_id": trace_id, "key": "HALT_TRADING", "value": "true", "reason": args.reason},
+            summary_kv = build_system_summary(
+                event="HALT",
+                trace_id=trace_id,
+                level="WARN",
+                actor=args.by,
+                reason_code=args.reason_code,
+                reason=args.reason,
             )
+            send_system_alert(
+                telegram,
+                title="⏸️ 已暂停交易",
+                summary_kv=summary_kv,
+                payload={"key": "HALT_TRADING", "value": "true", "reason_code": args.reason_code,
+                         "reason": args.reason},
+            )
+            log_action(logger, action="HALT", trace_id=trace_id, reason_code=args.reason_code, reason=args.reason,
+                       client_order_id=None)
         print(f"OK trace_id={trace_id}")
         return
 
@@ -626,12 +694,29 @@ def main() -> None:
             reason_code=args.reason_code,
             reason=args.reason,
         )
+        write_control_command(
+            db,
+            command="RESUME",
+            payload={"actor": args.by, "reason_code": args.reason_code, "reason": args.reason, "trace_id": trace_id},
+        )
         if telegram.enabled():
-            telegram.send_alert_zh(
-                title="▶️ 已恢复交易",
-                summary_kv={"trace_id": trace_id, "原因": args.reason},
-                payload={"trace_id": trace_id, "key": "HALT_TRADING", "value": "false", "reason": args.reason},
+            summary_kv = build_system_summary(
+                event="RESUME",
+                trace_id=trace_id,
+                level="INFO",
+                actor=args.by,
+                reason_code=args.reason_code,
+                reason=args.reason,
             )
+            send_system_alert(
+                telegram,
+                title="▶️ 已恢复交易",
+                summary_kv=summary_kv,
+                payload={"key": "HALT_TRADING", "value": "false", "reason_code": args.reason_code,
+                         "reason": args.reason},
+            )
+            log_action(logger, action="RESUME", trace_id=trace_id, reason_code=args.reason_code, reason=args.reason,
+                       client_order_id=None)
         print(f"OK trace_id={trace_id}")
         return
 
@@ -647,12 +732,29 @@ def main() -> None:
             reason_code=args.reason_code,
             reason=args.reason,
         )
+        write_control_command(
+            db,
+            command="EMERGENCY_EXIT",
+            payload={"actor": args.by, "reason_code": args.reason_code, "reason": args.reason, "trace_id": trace_id},
+        )
         if telegram.enabled():
-            telegram.send_alert_zh(
-                title="🧯 已触发紧急退出",
-                summary_kv={"trace_id": trace_id, "原因": args.reason},
-                payload={"trace_id": trace_id, "key": "EMERGENCY_EXIT", "value": "true", "reason": args.reason},
+            summary_kv = build_system_summary(
+                event="EMERGENCY_EXIT",
+                trace_id=trace_id,
+                level="WARN",
+                actor=args.by,
+                reason_code=args.reason_code,
+                reason=args.reason,
             )
+            send_system_alert(
+                telegram,
+                title="🧯 已触发紧急退出",
+                summary_kv=summary_kv,
+                payload={"key": "EMERGENCY_EXIT", "value": "true", "reason_code": args.reason_code,
+                         "reason": args.reason},
+            )
+            log_action(logger, action="EMERGENCY_EXIT", trace_id=trace_id, reason_code=args.reason_code,
+                       reason=args.reason, client_order_id=None)
         print(f"OK trace_id={trace_id}")
         return
 

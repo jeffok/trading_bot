@@ -1,56 +1,82 @@
-"""幂等键与 client_order_id 生成。
+"""幂等键与 client_order_id 生成（V8.3 对齐）。
 
-里程碑 A 的目标：
-- client_order_id 必须对“同一交易机会/同一意图”的重试保持稳定；
-- 长度必须满足常见交易所限制（通常 <= 64）。
+文档口径（4.1.2）：
+  client_order_id = asv8-{symbol}-{side}-{timeframe}-{bar_close_ts}-{nonce}
 
-约定：
-- 对策略信号 BUY/SELL：使用最新 K 线 open_time_ms 作为机会锚点（同一根 K 内重试 id 不变）。
-- 对止损/紧急退出：同样使用当根 K 线 open_time_ms 作为锚点（保证短期重试幂等）。
+设计目标：
+- 同一“交易机会/同一意图”的重试必须生成相同的 client_order_id（幂等）。
+- 保持可读性，同时控制长度（常见限制 <= 64）。
 
-注意：
-- 这里不引入 decision_records 表（那是后续里程碑），因此无法跨多根 K 线保持同一意图的 id。
-  但对 MVP 来说：一旦成功成交会写 position_snapshots，下一轮就不会重复下单。
+说明：
+- symbol：做 normalize（去掉 / - : 空格 等）
+- side：BUY / SELL
+- timeframe：例如 15m（由 interval_minutes 推导）
+- bar_close_ts：毫秒时间戳（kline_open_time_ms + interval_ms）
+- nonce：用于区分同一根 K 内不同动作；默认从 trace_id 派生稳定短 hash（保证重试一致）
 """
 
 from __future__ import annotations
 
 import hashlib
+from typing import Optional
 
 
 def normalize_symbol(symbol: str) -> str:
-    """把交易对转成可用于 client_order_id 的短格式。"""
     s = (symbol or "").upper().strip()
-    # 常见形态：BTC/USDT、BTCUSDT、BTC-USDT
     for ch in ["/", "-", ":", " "]:
         s = s.replace(ch, "")
     return s
+
+
+def _short_hash(s: str, n: int = 8) -> str:
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[: max(4, int(n))]
+
+
+def make_client_order_id_v83(
+    *,
+    symbol: str,
+    side: str,
+    interval_minutes: int,
+    kline_open_time_ms: int,
+    nonce: str,
+    max_len: int = 64,
+) -> str:
+    """V8.3 口径的 client_order_id 生成器。"""
+    sym = normalize_symbol(symbol)
+    sd = (side or "").upper().strip()
+    tf = f"{int(interval_minutes)}m"
+    close_ts = int(kline_open_time_ms) + int(interval_minutes) * 60_000
+    nn = (nonce or "0").strip()
+    base = f"asv8-{sym}-{sd}-{tf}-{close_ts}-{nn}"
+    if len(base) <= max_len:
+        return base
+
+    # 超长：缩短 symbol + hash 保持唯一
+    sym_short = sym[:10]
+    h = _short_hash(base, 10)
+    short = f"asv8-{sym_short}-{sd}-{tf}-{close_ts}-{h}"
+    return short[:max_len]
 
 
 def make_client_order_id(
     action: str,
     symbol: str,
     *,
+    interval_minutes: int,
     kline_open_time_ms: int,
-    strategy_tag: str = "sb",
+    trace_id: Optional[str] = None,
     max_len: int = 64,
 ) -> str:
-    """生成稳定的 client_order_id。
-
-    参数：
-    - action: buy/sell/sl/exit 等动作前缀
-    - symbol: 交易对
-    - kline_open_time_ms: 机会锚点（同一根 K 不变）
-    - strategy_tag: 策略/版本标签，避免不同策略冲突
-    """
+    """兼容旧调用点的包装器（映射到 V8.3 格式）。"""
     a = (action or "").lower().strip()
-    sym = normalize_symbol(symbol)
-    base = f"{a}_{strategy_tag}_{sym}_{int(kline_open_time_ms)}"
-    if len(base) <= max_len:
-        return base
-
-    # 超长则做 hash 缩短，但保持可读的前缀
-    h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
-    sym_short = sym[:10]
-    short = f"{a}_{strategy_tag}_{sym_short}_{int(kline_open_time_ms)}_{h}"
-    return short[:max_len]
+    side = "BUY" if a in ("buy", "open", "long") else "SELL"
+    base_nonce = _short_hash(trace_id or f"{symbol}-{kline_open_time_ms}", 8)
+    nonce = f"{a[:2]}{base_nonce}"
+    return make_client_order_id_v83(
+        symbol=symbol,
+        side=side,
+        interval_minutes=int(interval_minutes),
+        kline_open_time_ms=int(kline_open_time_ms),
+        nonce=nonce,
+        max_len=max_len,
+    )

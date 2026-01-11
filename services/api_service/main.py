@@ -4,24 +4,29 @@ import os
 from datetime import datetime, timezone
 import json
 import time
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from shared.config import Settings
+from shared.config import Settings, load_settings, ALLOWED_EXCHANGES
 from shared.db import MariaDB, migrate
 from shared.redis import redis_client
 from shared.logging import get_logger, new_trace_id
 from shared.domain.time import HK
-from shared.telemetry import Telegram
+from shared.telemetry import Telegram, log_action
+from shared.domain.control_commands import write_control_command
+from shared.domain.heartbeat import upsert_service_status
+from shared.domain.instance import get_instance_id
+from shared.domain.events import append_error_event
 
 SERVICE = "api-service"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 logger = get_logger(SERVICE, os.getenv("LOG_LEVEL", "INFO"))
 # ===== Admin models (V8.3 hard requirement: actor + reason_code + reason) =====
@@ -41,6 +46,25 @@ def _parse_bool(v: Optional[str]) -> bool:
     if v is None:
         return False
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _parse_symbols_list(raw: str) -> list[str]:
+    import re as _re
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parts = []
+    for token in _re.split(r"[\s,]+", raw):
+        t = token.strip().upper()
+        if t:
+            parts.append(t)
+    seen = set()
+    out = []
+    for s in parts:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
 
 
 def get_system_config(db: MariaDB, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -100,13 +124,18 @@ def tg_alert(
         telegram.send_alert(title=title, summary_lines=[f"{k}={v}" for k, v in summary_kv.items()], payload=payload)
 
 
+
+    try:
+        log_action(logger, event, trace_id=trace_id, level=level, title=title, **(summary_extra or {}))
+    except Exception:
+        pass
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     FastAPI 推荐的生命周期事件（替代 on_event startup/shutdown）
     这里做：数据库迁移 + 启动告警（可选）
     """
-    settings = Settings()
+    settings = load_settings()
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
 
     trace_id = new_trace_id("startup")
@@ -142,10 +171,42 @@ async def lifespan(app: FastAPI):
         raise
 
     # 进入运行期
+
+    # API 服务心跳（写入 service_status）
+    stop_evt = threading.Event()
+    instance_id = get_instance_id(SERVICE, settings.instance_id)
+
+    def _hb_loop() -> None:
+        db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+        started = time.time()
+        while not stop_evt.is_set():
+            try:
+                status = {
+                    "service": SERVICE,
+                    "version": VERSION,
+                    "env": settings.env,
+                    "exchange": settings.exchange,
+                    "symbol": settings.symbol,
+                    "uptime_sec": int(time.time() - started),
+                    "pid": os.getpid(),
+                }
+                upsert_service_status(db, service_name=SERVICE, instance_id=instance_id, status=status)
+            except Exception:
+                # 心跳失败不应导致服务退出
+                logger.exception("heartbeat failed")
+            stop_evt.wait(max(5, int(getattr(settings, "heartbeat_interval_seconds", 30))))
+    api_heartbeat_thread = threading.Thread(target=_hb_loop, name="api-hb", daemon=True)
+    api_heartbeat_thread.start()
+
     yield
 
     # shutdown（可选）
     try:
+        stop_evt.set()
+        try:
+            api_heartbeat_thread.join(timeout=2)
+        except Exception:
+            pass
         trace_id2 = new_trace_id("shutdown")
         tg_alert(
             telegram,
@@ -162,9 +223,36 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=SERVICE, version=VERSION, lifespan=lifespan)
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    settings = load_settings()
+    trace_id = new_trace_id("api_exc")
+    try:
+        db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+        # use first effective symbol if available
+        sym = (list(getattr(settings, "symbols", ()) or []) + [getattr(settings, "symbol", "")])[0] or "UNKNOWN"
+        append_error_event(
+            db,
+            trace_id=trace_id,
+            service=SERVICE,
+            exchange=settings.exchange,
+            symbol=str(sym),
+            reason=f"api_exception: {str(exc)[:200]}",
+            payload={
+                "path": str(request.url.path),
+                "method": str(request.method),
+                "error": str(exc),
+            },
+            reason_code="SYSTEM",
+        )
+    except Exception:
+        pass
+    logger.exception(f"unhandled_exception trace_id={trace_id} err={exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error", "trace_id": trace_id})
+
 
 def get_settings() -> Settings:
-    return Settings()
+    return load_settings()
 
 
 def get_db(settings: Settings = Depends(get_settings)) -> MariaDB:
@@ -192,13 +280,116 @@ def require_admin(request: Request, authorization: str = Header(default=""), set
 
 @app.get("/health")
 def health(settings: Settings = Depends(get_settings), db: MariaDB = Depends(get_db)) -> Dict[str, Any]:
+    """Lightweight health endpoint (no admin auth).
+    Includes: db ping, halt/emergency flags, last heartbeats, and market data lag for effective symbols.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_hk = now_utc.astimezone(HK)
+
+    # runtime flags
+    halt_raw = get_system_config(db, "HALT_TRADING", "false")
+    emergency_raw = get_system_config(db, "EMERGENCY_EXIT", "false")
+
+    # services latest heartbeat snapshot
+    rows = db.fetch_all(
+        """
+        SELECT service_name, instance_id, last_heartbeat, status_json
+        FROM service_status
+        ORDER BY last_heartbeat DESC
+        LIMIT 50
+        """
+    )
+    services: Dict[str, Any] = {}
+    for r in rows or []:
+        name = r["service_name"]
+        if name in services:
+            continue
+        try:
+            status_json = json.loads(r["status_json"]) if isinstance(r["status_json"], str) else r["status_json"]
+        except Exception:
+            status_json = {"raw": r["status_json"]}
+        services[name] = {
+            "instance_id": r["instance_id"],
+            "last_heartbeat": str(r["last_heartbeat"]),
+            "status": status_json,
+        }
+
+    base_syms = list(getattr(settings, "symbols", ()) or [])
+    if not base_syms:
+        base_syms = [settings.symbol]
+    effective_symbols = _normalize_symbols(base_syms)
+
+    # market data lag (only effective symbols)
+    now_ms = int(time.time() * 1000)
+    data_lag: List[Dict[str, Any]] = []
+    for sym in effective_symbols:
+        r = db.fetch_one(
+            "SELECT MAX(open_time_ms) AS last_open_time_ms FROM market_data_cache WHERE symbol=%s AND interval_minutes=%s AND feature_version=%s",
+            (sym, int(settings.interval_minutes), int(settings.feature_version)),
+        )
+        last_ot = int(r["last_open_time_ms"]) if r and r.get("last_open_time_ms") is not None else None
+        lag_ms = (now_ms - last_ot) if last_ot else None
+        data_lag.append({"symbol": sym, "last_open_time_ms": last_ot, "lag_ms": lag_ms})
+
+
+    # engine last tick (best-effort)
+    engine_last_tick: Dict[str, Any] = {}
+    try:
+        se = services.get("strategy-engine") or services.get("strategy_engine")
+        if se and isinstance(se.get("status"), dict):
+            st = se.get("status")
+            engine_last_tick = {
+                "last_tick_id": st.get("last_tick_id"),
+                "last_tick_ts_utc": st.get("last_tick_ts_utc"),
+                "last_tick_ts_hk": st.get("last_tick_ts_hk"),
+                "trace_id": st.get("trace_id"),
+            }
+    except Exception:
+        engine_last_tick = {}
+
+    # recent errors summary (best-effort)
+    recent_errors: List[Dict[str, Any]] = []
+    try:
+        err_rows = db.fetch_all(
+            """
+            SELECT id, created_at, trace_id, service, exchange, symbol, client_order_id, reason_code, reason
+            FROM order_events
+            WHERE event_type='ERROR'
+            ORDER BY id DESC
+            LIMIT 10
+            """
+        )
+        for r in err_rows or []:
+            recent_errors.append(
+                {
+                    "id": int(r.get("id") or 0),
+                    "created_at": str(r.get("created_at")),
+                    "trace_id": r.get("trace_id"),
+                    "service": r.get("service"),
+                    "exchange": r.get("exchange"),
+                    "symbol": r.get("symbol"),
+                    "client_order_id": r.get("client_order_id"),
+                    "reason_code": r.get("reason_code"),
+                    "reason": (str(r.get("reason") or "")[:200]),
+                }
+            )
+    except Exception:
+        recent_errors = []
     return {
         "service": SERVICE,
         "version": VERSION,
         "env": settings.env,
         "exchange": settings.exchange,
-        "symbol": settings.symbol,
+        "symbols": effective_symbols,
+        "now_utc": now_utc.isoformat(),
+        "now_hk": now_hk.isoformat(),
         "db_ok": db.ping(),
+        "halt_trading": _parse_bool(halt_raw),
+        "emergency_exit": _parse_bool(emergency_raw),
+        "services": services,
+        "market_data_lag": data_lag,
+        "engine_last_tick": engine_last_tick,
+        "recent_errors": recent_errors,
     }
 
 
@@ -245,6 +436,43 @@ def admin_status(
     halt_raw = get_system_config(db, "HALT_TRADING", "false")
     emergency_raw = get_system_config(db, "EMERGENCY_EXIT", "false")
 
+    use_stop_raw = get_system_config(db, "USE_PROTECTIVE_STOP_ORDER", "true" if getattr(settings, "use_protective_stop_order", True) else "false")
+    stop_poll_raw = get_system_config(db, "STOP_ORDER_POLL_SECONDS", str(getattr(settings, "stop_order_poll_seconds", 10)))
+    stop_arm_retries_raw = get_system_config(db, "STOP_ARM_MAX_RETRIES", str(getattr(settings, "stop_arm_max_retries", 3)))
+    stop_arm_backoff_raw = get_system_config(db, "STOP_ARM_BACKOFF_BASE_SECONDS", str(getattr(settings, "stop_arm_backoff_base_seconds", 0.5)))
+    stop_rearm_max_raw = get_system_config(db, "STOP_REARM_MAX_ATTEMPTS", str(getattr(settings, "stop_rearm_max_attempts", 2)))
+    stop_rearm_cd_raw = get_system_config(db, "STOP_REARM_COOLDOWN_SECONDS", str(getattr(settings, "stop_rearm_cooldown_seconds", 60)))
+    use_protective_stop_order = _parse_bool(use_stop_raw)
+    try:
+        stop_order_poll_seconds = int(float(stop_poll_raw))
+    except Exception:
+        stop_order_poll_seconds = int(getattr(settings, "stop_order_poll_seconds", 10))
+    try:
+        stop_arm_max_retries = int(float(stop_arm_retries_raw))
+    except Exception:
+        stop_arm_max_retries = int(getattr(settings, "stop_arm_max_retries", 3))
+
+    try:
+        stop_arm_backoff_base_seconds = float(stop_arm_backoff_raw)
+    except Exception:
+        stop_arm_backoff_base_seconds = float(getattr(settings, "stop_arm_backoff_base_seconds", 0.5))
+
+    try:
+        stop_rearm_max_attempts = int(float(stop_rearm_max_raw))
+    except Exception:
+        stop_rearm_max_attempts = int(getattr(settings, "stop_rearm_max_attempts", 2))
+
+    try:
+        stop_rearm_cooldown_seconds = int(float(stop_rearm_cd_raw))
+    except Exception:
+        stop_rearm_cooldown_seconds = int(getattr(settings, "stop_rearm_cooldown_seconds", 60))
+
+    symbols_db_raw = get_system_config(db, "SYMBOLS", "")
+    symbols_db = _parse_symbols_list(symbols_db_raw)
+    env_symbols = list(settings.symbols) if getattr(settings, "symbols", None) else [settings.symbol]
+    effective_symbols = symbols_db if symbols_db else env_symbols
+    symbols_from_db = bool(symbols_db)
+
     # latest heartbeat per service (if any)
     rows = db.fetch_all(
         """
@@ -273,8 +501,10 @@ def admin_status(
         """
         SELECT symbol, MAX(open_time_ms) AS last_open_time_ms
         FROM market_data_cache
+        WHERE interval_minutes=%s AND feature_version=%s
         GROUP BY symbol
-        """
+        """,
+        (int(settings.interval_minutes), int(settings.feature_version)),
     )
     now_ms = int(time.time() * 1000)
     data_lag: List[Dict[str, Any]] = []
@@ -307,8 +537,18 @@ def admin_status(
         "ok": True,
         "trace_id": trace_id,
         "config": {
+            "EXCHANGE": settings.exchange,
+            "SUPPORTED_EXCHANGES": sorted(list(ALLOWED_EXCHANGES)),
             "HALT_TRADING": _parse_bool(halt_raw),
             "EMERGENCY_EXIT": _parse_bool(emergency_raw),
+            "EFFECTIVE_SYMBOLS": effective_symbols,
+            "SYMBOLS_FROM_DB": symbols_from_db,
+            "USE_PROTECTIVE_STOP_ORDER": bool(use_protective_stop_order),
+            "STOP_ORDER_POLL_SECONDS": int(stop_order_poll_seconds),
+            "STOP_ARM_MAX_RETRIES": int(stop_arm_max_retries),
+            "STOP_ARM_BACKOFF_BASE_SECONDS": float(stop_arm_backoff_base_seconds),
+            "STOP_REARM_MAX_ATTEMPTS": int(stop_rearm_max_attempts),
+            "STOP_REARM_COOLDOWN_SECONDS": int(stop_rearm_cooldown_seconds),
         },
         "open_positions": open_positions,
         "positions": positions,
@@ -340,6 +580,16 @@ def admin_halt(
         trace_id=trace_id,
         reason_code=cmd.reason_code,
         reason=reason,
+    )
+    # audit queue (control_commands)
+    write_control_command(
+        db,
+        command="HALT",
+        payload={"actor": cmd.by, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        trace_id=trace_id,
+        actor=cmd.by,
+        reason_code=cmd.reason_code,
+        reason=cmd.reason,
     )
 
     tg_alert(
@@ -374,6 +624,15 @@ def admin_resume(
         reason_code=cmd.reason_code,
         reason=reason,
     )
+    write_control_command(
+        db,
+        command="RESUME",
+        payload={"actor": cmd.by, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        trace_id=trace_id,
+        actor=cmd.by,
+        reason_code=cmd.reason_code,
+        reason=cmd.reason,
+    )
 
     tg_alert(
         Telegram(settings.telegram_bot_token, settings.telegram_chat_id),
@@ -407,6 +666,15 @@ def admin_emergency_exit(
         trace_id=trace_id,
         reason_code=cmd.reason_code,
         reason=reason,
+    )
+    write_control_command(
+        db,
+        command="EMERGENCY_EXIT",
+        payload={"actor": cmd.by, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        trace_id=trace_id,
+        actor=cmd.by,
+        reason_code=cmd.reason_code,
+        reason=cmd.reason,
     )
 
     tg_alert(
@@ -447,6 +715,15 @@ def admin_update_config(
         reason_code=cmd.reason_code,
         reason=reason,
     )
+    write_control_command(
+        db,
+        command="UPDATE_CONFIG",
+        payload={"actor": cmd.by, "key": cmd.key, "value": cmd.value, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        trace_id=trace_id,
+        actor=cmd.by,
+        reason_code=cmd.reason_code,
+        reason=cmd.reason,
+    )
 
     tg_alert(
         Telegram(settings.telegram_bot_token, settings.telegram_chat_id),
@@ -458,3 +735,129 @@ def admin_update_config(
         payload_extra={"reason_code": cmd.reason_code, "key": key, "value": value, "reason": reason},
     )
     return {"ok": True, "trace_id": trace_id}
+
+
+@app.get("/admin/control_commands")
+def admin_control_commands(
+    status: str = "NEW",
+    limit: int = 50,
+    db: MariaDB = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    """List control_commands for debugging/audit.
+
+    - status: NEW|PROCESSED|ERROR|ALL
+    """
+    s = (status or "NEW").strip().upper()
+    lim = max(1, min(int(limit or 50), 200))
+
+    if s == "ALL":
+        rows = db.fetch_all(
+            """
+            SELECT id, created_at, processed_at, command, status, payload_json, trace_id, actor, reason_code, reason
+            FROM control_commands
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (lim,),
+        )
+    else:
+        rows = db.fetch_all(
+            """
+            SELECT id, created_at, processed_at, command, status, payload_json, trace_id, actor, reason_code, reason
+            FROM control_commands
+            WHERE status=%s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (s, lim),
+        )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        payload = {}
+        try:
+            payload = json.loads(r.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        out.append(
+            {
+                "id": int(r.get("id") or 0),
+                "created_at": str(r.get("created_at")),
+                "processed_at": str(r.get("processed_at")) if r.get("processed_at") is not None else None,
+                "command": str(r.get("command") or ""),
+                "status": str(r.get("status") or ""),
+                "payload": payload,
+                "trace_id": str(r.get("trace_id")) if r.get("trace_id") is not None else None,
+                "actor": str(r.get("actor")) if r.get("actor") is not None else None,
+                "reason_code": str(r.get("reason_code")) if r.get("reason_code") is not None else None,
+                "reason": str(r.get("reason")) if r.get("reason") is not None else None,
+            }
+        )
+
+    return {"count": len(out), "items": out}
+
+
+@app.get("/admin/ai_models")
+def admin_ai_models(
+    model_name: str = "",
+    current_only: bool = True,
+    limit: int = 30,
+    db: MariaDB = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    """List ai_models metadata.
+
+    - current_only=true: only is_current=1
+    """
+    lim = max(1, min(int(limit or 30), 200))
+    mn = (model_name or "").strip()
+
+    where = []
+    params = []
+    if mn:
+        where.append("model_name=%s")
+        params.append(mn)
+    if current_only:
+        where.append("is_current=1")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    rows = db.fetch_all(
+        f"""
+        SELECT id, created_at, model_name, version, is_current, metrics_json,
+               OCTET_LENGTH(blob) AS blob_bytes
+        FROM ai_models
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (*params, lim),
+    )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        metrics = {}
+        try:
+            mj = r.get("metrics_json")
+            if isinstance(mj, str):
+                metrics = json.loads(mj) if mj else {}
+            elif isinstance(mj, (dict, list)):
+                metrics = mj
+            else:
+                metrics = {}
+        except Exception:
+            metrics = {}
+        out.append(
+            {
+                "id": int(r.get("id") or 0),
+                "created_at": str(r.get("created_at")),
+                "model_name": str(r.get("model_name") or ""),
+                "version": str(r.get("version") or ""),
+                "is_current": int(r.get("is_current") or 0),
+                "blob_bytes": int(r.get("blob_bytes") or 0),
+                "metrics": metrics,
+            }
+        )
+
+    return {"count": len(out), "items": out}

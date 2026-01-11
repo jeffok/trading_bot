@@ -4,8 +4,10 @@ from enum import Enum
 class OrderEventType(str, Enum):
     CREATED = "CREATED"
     SUBMITTED = "SUBMITTED"
+    PARTIAL = "PARTIAL"
     FILLED = "FILLED"
     CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
     ERROR = "ERROR"
     RECONCILED = "RECONCILED"
 
@@ -14,11 +16,36 @@ class Side(str, Enum):
     SELL = "SELL"
 
 class ReasonCode(str, Enum):
+    RATE_LIMIT = "RATE_LIMIT"
+    RATE_LIMIT_HALT = "RATE_LIMIT_HALT"
+    RATE_LIMIT_429 = "RATE_LIMIT_429"
     # Strategy / trading
     STRATEGY_SIGNAL = "STRATEGY_SIGNAL"
     STRATEGY_EXIT = "STRATEGY_EXIT"
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"
+
+    # Setup B (V8.3)
+    SETUP_B_SQUEEZE_RELEASE = "SETUP_B_SQUEEZE_RELEASE"
+
+    # Risk budget (V8.3)
+    RISK_BUDGET_ADJUST_LEVERAGE = "RISK_BUDGET_ADJUST_LEVERAGE"
+    RISK_BUDGET_REJECT = "RISK_BUDGET_REJECT"
+
+    # Circuit breaker / halt (V8.3)
+    CIRCUIT_BREAKER_HALT = "CIRCUIT_BREAKER_HALT"
+    DRAWDOWN_HALT = "DRAWDOWN_HALT"
+
+    # Tick budget
+    TICK_TIMEOUT = "TICK_TIMEOUT"
+
+
+    # Protective stop orders (B1/B2)
+    STOP_LOSS_ARMED = "STOP_LOSS_ARMED"
+    STOP_LOSS_ARM_FAILED = "STOP_LOSS_ARM_FAILED"
+    STOP_LOSS_REARMED = "STOP_LOSS_REARMED"
+    STOP_LOSS_REARM_FAILED = "STOP_LOSS_REARM_FAILED"
+    STOP_ORDER_INVALID = "STOP_ORDER_INVALID"
 
     # Admin / ops
     ADMIN_HALT = "ADMIN_HALT"
@@ -30,6 +57,7 @@ class ReasonCode(str, Enum):
     RECONCILE = "RECONCILE"
     DATA_SYNC = "DATA_SYNC"
     SYSTEM = "SYSTEM"
+    ERROR = "ERROR"
 
     # AI / learning
     AI_SELECT = "AI_SELECT"

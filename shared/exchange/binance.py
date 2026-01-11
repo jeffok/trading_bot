@@ -30,7 +30,7 @@ def _minutes_to_binance_interval(minutes: int) -> str:
         1440: "1d",
     }
     if minutes not in mapping:
-        raise ValueError(f"Unsupported interval_minutes={minutes}")
+        raise ValueError(f"Unsupported interval_minutes={minutes} for Binance")
     return mapping[minutes]
 
 
@@ -71,8 +71,9 @@ class BinanceUsdtFuturesClient(ExchangeClient):
         self.service_name = service_name
 
         # 预算：public 10 rps / private 5 rps（保守值）
-        self.limiter.ensure_budget("binance_public", 10, 10)
-        self.limiter.ensure_budget("binance_private", 5, 5)
+        self.limiter.ensure_budget("market_data", 10, 20)
+        self.limiter.ensure_budget("account", 5, 10)
+        self.limiter.ensure_budget("order", 5, 10)
 
         # 记忆：避免每次下单都重复设置
         self._prepared_symbols: set[str] = set()
@@ -104,8 +105,20 @@ class BinanceUsdtFuturesClient(ExchangeClient):
                 resp = client.request(method, url, params=params2, headers=headers)
 
             if resp.status_code in (429, 418):
-                self.limiter.backoff(budget, 2.0)
-                raise RateLimitError(resp.text[:200])
+                retry_after = None
+                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                if ra:
+                    try:
+                        retry_after = float(ra)
+                    except Exception:
+                        retry_after = None
+                decision = self.limiter.feedback_rate_limited(budget, retry_after_seconds=retry_after, status_code=resp.status_code)
+                raise RateLimitError(
+                    message=resp.text[:200],
+                    retry_after_seconds=decision.get("backoff_seconds"),
+                    group=budget,
+                    severe=bool(decision.get("severe")),
+                )
             if resp.status_code in (401, 403):
                 raise AuthError(resp.text[:200])
             if resp.status_code >= 500:
@@ -113,6 +126,7 @@ class BinanceUsdtFuturesClient(ExchangeClient):
             if resp.status_code >= 400:
                 raise ExchangeError(resp.text[:200])
 
+            self.limiter.feedback_ok(budget, headers=dict(resp.headers))
             return resp.json()
         except httpx.TimeoutException as e:
             raise TemporaryError(str(e)) from e
@@ -132,7 +146,7 @@ class BinanceUsdtFuturesClient(ExchangeClient):
                 "/fapi/v1/marginType",
                 params={"symbol": symbol, "marginType": "ISOLATED"},
                 signed=True,
-                budget="binance_private",
+                budget="account",
             )
         except ExchangeError:
             # 已设置/不支持等情况：不阻塞策略运行
@@ -145,7 +159,7 @@ class BinanceUsdtFuturesClient(ExchangeClient):
                 "/fapi/v1/leverage",
                 params={"symbol": symbol, "leverage": str(self.leverage)},
                 signed=True,
-                budget="binance_private",
+                budget="account",
             )
         except ExchangeError:
             pass
@@ -161,7 +175,7 @@ class BinanceUsdtFuturesClient(ExchangeClient):
         if start_ms is not None:
             params["startTime"] = int(start_ms)
 
-        data = self._request("GET", "/fapi/v1/klines", params=params, signed=False, budget="binance_public")
+        data = self._request("GET", "/fapi/v1/klines", params=params, signed=False, budget="market_data")
         out: List[Kline] = []
         for row in data:
             # row layout (futures klines) 与 spot 基本一致
@@ -200,7 +214,7 @@ class BinanceUsdtFuturesClient(ExchangeClient):
         if side_u == "SELL":
             params["reduceOnly"] = "true"
 
-        data = self._request("POST", "/fapi/v1/order", params=params, signed=True, budget="binance_private")
+        data = self._request("POST", "/fapi/v1/order", params=params, signed=True, budget="order")
 
         order_id = str(data.get("orderId", ""))
         status = str(data.get("status", "UNKNOWN"))
@@ -245,12 +259,12 @@ class BinanceUsdtFuturesClient(ExchangeClient):
         else:
             params["origClientOrderId"] = client_order_id
 
-        data = self._request("GET", "/fapi/v1/order", params=params, signed=True, budget="binance_private")
+        data = self._request("GET", "/fapi/v1/order", params=params, signed=True, budget="order")
         return OrderResult(
             exchange_order_id=str(data.get("orderId", "")),
             status=str(data.get("status", "UNKNOWN")),
             filled_qty=float(data.get("executedQty", 0.0) or 0.0),
-            avg_price=None,
+            avg_price=(float(data.get("avgPrice", 0.0) or 0.0) or None),
             raw=data,
         )
 
@@ -277,7 +291,7 @@ class BinanceUsdtFuturesClient(ExchangeClient):
                     "/fapi/v1/userTrades",
                     params={"symbol": symbol, "orderId": order_id},
                     signed=True,
-                    budget="binance_private",
+                    budget="account",
                 )
             except ExchangeError:
                 trades = []
@@ -319,3 +333,69 @@ class BinanceUsdtFuturesClient(ExchangeClient):
 
         # 超时：返回 None（上层告警可展示“未知”）
         return None, None
+
+    def place_stop_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        stop_price: float,
+        client_order_id: str,
+        reduce_only: bool = True,
+    ) -> OrderResult:
+        side_u = side.upper()
+        if side_u not in ("BUY", "SELL"):
+            raise ValueError(f"Invalid side={side}")
+
+        # Ensure isolated + leverage for safety (idempotent)
+        self._ensure_isolated_and_leverage(symbol)
+
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side_u,
+            "type": "STOP_MARKET",
+            "stopPrice": str(stop_price),
+            "quantity": str(qty),
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "RESULT",
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        # extra safety flags (best-effort)
+        params["priceProtect"] = "TRUE"
+        params["workingType"] = "CONTRACT_PRICE"
+
+        data = self._request("POST", "/fapi/v1/order", params=params, signed=True, budget="order")
+
+        order_id = str(data.get("orderId") or "")
+        status = str(data.get("status") or "NEW")
+        executed_qty = float(data.get("executedQty") or 0.0)
+        avg_price = None
+        try:
+            ap = data.get("avgPrice")
+            if ap is not None and str(ap) != "":
+                avg_price = float(ap)
+        except Exception:
+            avg_price = None
+
+        return OrderResult(
+            exchange_order_id=order_id,
+            status=status,
+            filled_qty=executed_qty,
+            avg_price=avg_price,
+            raw=data,
+        )
+
+    def cancel_order(self, *, symbol: str, client_order_id: str, exchange_order_id: Optional[str]) -> bool:
+        params: Dict[str, Any] = {"symbol": symbol}
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
+        elif exchange_order_id:
+            params["orderId"] = exchange_order_id
+
+        try:
+            self._request("DELETE", "/fapi/v1/order", params=params, signed=True, budget="order")
+            return True
+        except Exception:
+            return False

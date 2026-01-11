@@ -1,1 +1,3 @@
 from .online_model import OnlineLogisticRegression
+from .sgd_compat import SGDClassifierCompat
+from .model_store import load_current_model_blob, save_current_model_blob

@@ -57,8 +57,9 @@ class BybitV5LinearClient(ExchangeClient):
         self.metrics = metrics
         self.service_name = service_name
 
-        self.limiter.ensure_budget("bybit_public", 10, 10)
-        self.limiter.ensure_budget("bybit_private", 5, 5)
+        self.limiter.ensure_budget("market_data", 10, 20)
+        self.limiter.ensure_budget("account", 5, 10)
+        self.limiter.ensure_budget("order", 5, 10)
 
         self._prepared_symbols: set[str] = set()
 
@@ -127,9 +128,21 @@ class BybitV5LinearClient(ExchangeClient):
                     else:
                         resp = client.request(method, url, params=send_params, headers=headers, json=json_body)
 
-            if resp.status_code == 429:
-                self.limiter.backoff(budget, 2.0)
-                raise RateLimitError(resp.text[:200])
+            if resp.status_code in (429, 418):
+                retry_after = None
+                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                if ra:
+                    try:
+                        retry_after = float(ra)
+                    except Exception:
+                        retry_after = None
+                decision = self.limiter.feedback_rate_limited(budget, retry_after_seconds=retry_after, status_code=resp.status_code)
+                raise RateLimitError(
+                    message=resp.text[:200],
+                    retry_after_seconds=decision.get("backoff_seconds"),
+                    group=budget,
+                    severe=bool(decision.get("severe")),
+                )
             if resp.status_code in (401, 403):
                 raise AuthError(resp.text[:200])
             if resp.status_code >= 500:
@@ -143,6 +156,7 @@ class BybitV5LinearClient(ExchangeClient):
             if isinstance(data, dict) and data.get("retCode") not in (0, "0", None):
                 raise ExchangeError(f"{data.get('retMsg')} (retCode={data.get('retCode')})")
 
+            self.limiter.feedback_ok(budget, headers=dict(resp.headers))
             return data
         except httpx.TimeoutException as e:
             raise TemporaryError(str(e)) from e
@@ -166,7 +180,7 @@ class BybitV5LinearClient(ExchangeClient):
                     "sellLeverage": str(self.leverage),
                 },
                 signed=True,
-                budget="bybit_private",
+                budget="account",
             )
         except ExchangeError:
             # 不阻塞主流程
@@ -187,7 +201,7 @@ class BybitV5LinearClient(ExchangeClient):
         if start_ms is not None:
             params["start"] = int(start_ms)
 
-        data = self._request("GET", "/v5/market/kline", params=params, signed=False, budget="bybit_public")
+        data = self._request("GET", "/v5/market/kline", params=params, signed=False, budget="market_data")
 
         rows = (((data or {}).get("result") or {}).get("list") or [])
         out: List[Kline] = []
@@ -234,7 +248,7 @@ class BybitV5LinearClient(ExchangeClient):
         if self.position_idx:
             payload["positionIdx"] = int(self.position_idx)
 
-        data = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="bybit_private")
+        data = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="account")
         result = (data or {}).get("result") or {}
         order_id = str(result.get("orderId", ""))
 
@@ -266,44 +280,41 @@ class BybitV5LinearClient(ExchangeClient):
             except Exception:
                 avg_price = None
 
-        return OrderResult(
-            exchange_order_id=order_id,
-            status=status,
-            filled_qty=filled_qty,
-            avg_price=avg_price,
-            fee_usdt=fee_usdt,
-            pnl_usdt=pnl_usdt,
-            raw=data if isinstance(data, dict) else {"raw": data},
-        )
+        avg_price = None
 
-    # -------------------------
-    # ✅ 必须实现：抽象方法 get_order_status
-    # -------------------------
-    def get_order_status(self, *, symbol: str, client_order_id: str, exchange_order_id: Optional[str]) -> OrderResult:
-        params: Dict[str, Any] = {"category": "linear", "symbol": symbol}
-        if exchange_order_id:
-            params["orderId"] = exchange_order_id
-        else:
-            params["orderLinkId"] = client_order_id
-
-        data = self._request("GET", "/v5/order/realtime", params=params, signed=True, budget="bybit_private")
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        if not lst:
-            return OrderResult(exchange_order_id=exchange_order_id or "", status="UNKNOWN", filled_qty=0.0, raw=data)
-
-        o = lst[0]
-        status = str(o.get("orderStatus", "UNKNOWN"))
         try:
-            filled_qty = float(o.get("cumExecQty", "0") or 0.0)
+
+            avg_price = float(o.get("avgPrice", 0) or 0.0) or None
+
         except Exception:
-            filled_qty = 0.0
+
+            avg_price = None
+
+        if avg_price is None and filled_qty > 0:
+
+            try:
+
+                cum_value = float(o.get("cumExecValue", 0) or 0.0)
+
+                avg_price = (cum_value / filled_qty) if cum_value > 0 else None
+
+            except Exception:
+
+                avg_price = None
+
 
         return OrderResult(
+
             exchange_order_id=str(o.get("orderId", exchange_order_id or "")),
+
             status=status,
+
             filled_qty=filled_qty,
-            avg_price=None,
+
+            avg_price=avg_price,
+
             raw=data,
+
         )
 
     # -------------------------
@@ -331,7 +342,7 @@ class BybitV5LinearClient(ExchangeClient):
                         "limit": "50",
                     },
                     signed=True,
-                    budget="bybit_private",
+                    budget="account",
                 )
             except ExchangeError:
                 data = None
@@ -358,3 +369,55 @@ class BybitV5LinearClient(ExchangeClient):
             time.sleep(0.3)
 
         return None, None
+
+    def place_stop_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        stop_price: float,
+        client_order_id: str,
+        reduce_only: bool = True,
+    ) -> OrderResult:
+        side_u = side.upper()
+        if side_u not in ("BUY", "SELL"):
+            raise ValueError(f"Invalid side={side}")
+
+        self._ensure_isolated_and_leverage(symbol)
+
+        trigger_direction = 2 if side_u == "SELL" else 1  # 2: falls to trigger, 1: rises to trigger
+
+        payload: Dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": "Buy" if side_u == "BUY" else "Sell",
+            "orderType": "Market",
+            "qty": str(qty),
+            "orderLinkId": client_order_id,
+            "triggerPrice": str(stop_price),
+            "triggerDirection": trigger_direction,
+            "triggerBy": "LastPrice",
+            "timeInForce": "GoodTillCancel",
+        }
+        if reduce_only:
+            payload["reduceOnly"] = True
+            payload["closeOnTrigger"] = True
+
+        data = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="order")
+        result = (data or {}).get("result") or {}
+        order_id = str(result.get("orderId", ""))
+
+        return OrderResult(exchange_order_id=order_id, status="NEW", filled_qty=0.0, avg_price=None, raw=data)
+
+    def cancel_order(self, *, symbol: str, client_order_id: str, exchange_order_id: Optional[str]) -> bool:
+        payload: Dict[str, Any] = {"category": "linear", "symbol": symbol}
+        if client_order_id:
+            payload["orderLinkId"] = client_order_id
+        elif exchange_order_id:
+            payload["orderId"] = exchange_order_id
+        try:
+            self._request("POST", "/v5/order/cancel", json_body=payload, signed=True, budget="order")
+            return True
+        except Exception:
+            return False

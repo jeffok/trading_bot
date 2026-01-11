@@ -3,22 +3,31 @@ from __future__ import annotations
 import json
 import os
 import time
+import statistics
+from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from shared.config import Settings
+from shared.config import Settings, load_settings
 from shared.db import MariaDB, migrate
 from shared.exchange import make_exchange
+from shared.exchange.errors import RateLimitError
 from shared.logging import get_logger, new_trace_id
 from shared.redis import LeaderElector, redis_client
 from shared.domain.heartbeat import upsert_service_status
 from shared.domain.instance import get_instance_id
+from shared.domain.runtime_config import RuntimeConfig
 from shared.telemetry import Metrics, Telegram, start_metrics_http_server
+from shared.telemetry.system_alerts import send_system_alert, build_system_summary
 from shared.domain.time import now_ms, HK
+from shared.domain.events import append_error_event
 
 SERVICE = "data-syncer"
 logger = get_logger(SERVICE, os.getenv("LOG_LEVEL", "INFO"))
+
+# Per-symbol lag alert throttling (in-memory)
+LAG_ALERT_LAST_AT: dict[str, float] = {}
 
 
 # ----------------------------
@@ -76,6 +85,8 @@ def compute_features_for_bars(
     atr_period: int = 14,
     adx_period: int = 14,
     bb_period: int = 20,
+    kc_period: int = 20,
+    kc_mult: float = 1.5,
     mom_period: int = 10,
     vol_period: int = 20,
 ) -> List[Tuple[int, float, float, Optional[float], Dict[str, Any]]]:
@@ -83,139 +94,189 @@ def compute_features_for_bars(
 
     Returns list of:
       (open_time_ms, ema_fast, ema_slow, rsi, features_dict)
-    where features_dict is stored into features_json.
+
+    Notes (V8.3 / Setup B):
+    - Adds Keltner Channel + Squeeze status + RSI slope (for Setup B).
+    - BTC correlation is computed in process_precompute_tasks (needs BTC series).
     """
+
     if not bars:
         return []
 
-    # Streaming windows
-    closes: Deque[float] = deque(maxlen=5000)
-    gains: Deque[float] = deque(maxlen=rsi_period)
-    losses: Deque[float] = deque(maxlen=rsi_period)
+    # helpers (keep minimal and stable; no heavy deps)
+    def _ema_update(prev: Optional[float], price: float, period: int) -> float:
+        a = 2.0 / (period + 1.0)
+        return price if prev is None else (a * price + (1.0 - a) * prev)
 
-    bb_window: Deque[float] = deque(maxlen=bb_period)
-    vol_window: Deque[float] = deque(maxlen=vol_period)
-    ret_window: Deque[float] = deque(maxlen=vol_period)
+    def _rsi_update(closes: Deque[float], gains: Deque[float], losses: Deque[float], period: int, close: float) -> Optional[float]:
+        if closes:
+            chg = close - closes[-1]
+            gains.append(max(chg, 0.0))
+            losses.append(max(-chg, 0.0))
+        closes.append(close)
+        # warmup
+        if len(gains) < period or len(losses) < period:
+            return None
+        avg_gain = sum(list(gains)[-period:]) / period
+        avg_loss = sum(list(losses)[-period:]) / period
+        if avg_loss <= 1e-12:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
-    vol_sma_window: Deque[float] = deque(maxlen=bb_period)
-
-    ema_fast: Optional[float] = None
-    ema_slow: Optional[float] = None
-
-    # ATR / ADX state (Wilder)
-    prev_close: Optional[float] = None
-    prev_high: Optional[float] = None
-    prev_low: Optional[float] = None
-
-    tr_list: Deque[float] = deque(maxlen=atr_period)
-    plus_dm_list: Deque[float] = deque(maxlen=atr_period)
-    minus_dm_list: Deque[float] = deque(maxlen=atr_period)
-
-    atr: Optional[float] = None
-    plus_dm_s: Optional[float] = None
-    minus_dm_s: Optional[float] = None
-
-    dx_list: Deque[float] = deque(maxlen=adx_period)
-    adx: Optional[float] = None
+    def _true_range(high: float, low: float, prev_close: Optional[float]) -> float:
+        if prev_close is None:
+            return high - low
+        return max(high - low, abs(high - prev_close), abs(low - prev_close))
 
     out: List[Tuple[int, float, float, Optional[float], Dict[str, Any]]] = []
 
+    closes: Deque[float] = deque(maxlen=max(bb_period, mom_period, vol_period, rsi_period, 200) + 5)
+    highs: Deque[float] = deque(maxlen=200)
+    lows: Deque[float] = deque(maxlen=200)
+    vols: Deque[float] = deque(maxlen=200)
+    gains: Deque[float] = deque(maxlen=200)
+    losses: Deque[float] = deque(maxlen=200)
+    rsis: Deque[Optional[float]] = deque(maxlen=200)
+
+    ema_fast: Optional[float] = None
+    ema_slow: Optional[float] = None
+    kc_mid: Optional[float] = None
+
+    prev_close: Optional[float] = None
+
+    # ATR / ADX state
+    trs: Deque[float] = deque(maxlen=200)
+    dm_plus: Deque[float] = deque(maxlen=200)
+    dm_minus: Deque[float] = deque(maxlen=200)
+    dxs: Deque[float] = deque(maxlen=200)
+
+    prev_high: Optional[float] = None
+    prev_low: Optional[float] = None
+
+    def _sma(vals: List[float]) -> Optional[float]:
+        return (sum(vals) / len(vals)) if vals else None
+
+    def _std(vals: List[float]) -> Optional[float]:
+        if len(vals) < 2:
+            return None
+        try:
+            return float(statistics.pstdev(vals))
+        except Exception:
+            return None
+
     for i, b in enumerate(bars):
+        ot = int(b["open_time_ms"])
         close = float(b["close_price"])
         high = float(b["high_price"])
         low = float(b["low_price"])
         volume = float(b["volume"])
 
+        # base streams
+        highs.append(high)
+        lows.append(low)
+        vols.append(volume)
+
+        # EMA
         ema_fast = _ema_update(ema_fast, close, ema_fast_period)
         ema_slow = _ema_update(ema_slow, close, ema_slow_period)
+        kc_mid = _ema_update(kc_mid, close, kc_period)
+
+        # RSI
         rsi = _rsi_update(closes, gains, losses, rsi_period, close)
+        rsis.append(rsi)
 
         # Returns and momentum
         ret1 = None
         if prev_close is not None and prev_close != 0:
             ret1 = (close / prev_close) - 1.0
-            ret_window.append(ret1)
-
-        # Momentum (close - close_n)
+        # momentum based on close
         mom = None
         if len(closes) > mom_period:
-            # closes includes new close at end
-            mom = close - list(closes)[-1 - mom_period]
+            prev_n = list(closes)[-mom_period - 1]
+            if prev_n != 0:
+                mom = (close / prev_n) - 1.0
 
-        # Bollinger
-        bb_window.append(close)
+        # vol ratio
+        vol_sma = _sma(list(vols)[-vol_period:]) if len(vols) >= vol_period else None
+        vol_ratio = (volume / vol_sma) if (vol_sma and vol_sma > 0) else None
+
+        # ATR / DI / ADX
+        tr = _true_range(high, low, prev_close)
+        trs.append(tr)
+
+        if prev_high is None or prev_low is None:
+            dmp = 0.0
+            dmn = 0.0
+        else:
+            up_move = high - prev_high
+            down_move = prev_low - low
+            dmp = up_move if (up_move > down_move and up_move > 0) else 0.0
+            dmn = down_move if (down_move > up_move and down_move > 0) else 0.0
+        dm_plus.append(dmp)
+        dm_minus.append(dmn)
+
+        atr14 = _sma(list(trs)[-atr_period:]) if len(trs) >= atr_period else None
+        plus_di = None
+        minus_di = None
+        dx = None
+        adx14 = None
+        if atr14 and atr14 > 1e-12 and len(dm_plus) >= adx_period and len(dm_minus) >= adx_period:
+            sum_tr = sum(list(trs)[-adx_period:])
+            sum_p = sum(list(dm_plus)[-adx_period:])
+            sum_m = sum(list(dm_minus)[-adx_period:])
+            if sum_tr > 1e-12:
+                plus_di = 100.0 * (sum_p / sum_tr)
+                minus_di = 100.0 * (sum_m / sum_tr)
+                denom = (plus_di + minus_di)
+                if denom and denom > 1e-12:
+                    dx = 100.0 * abs(plus_di - minus_di) / denom
+                    dxs.append(float(dx))
+                    adx14 = _sma(list(dxs)[-adx_period:]) if len(dxs) >= adx_period else None
+
+        # Bollinger bands (SMA + std)
         bb_mid = None
         bb_upper = None
         bb_lower = None
         bb_width = None
-        if len(bb_window) == bb_period:
-            mid = _sma(bb_window)
-            sd = _std(bb_window)
-            bb_mid = mid
-            bb_upper = mid + 2.0 * sd
-            bb_lower = mid - 2.0 * sd
-            if mid != 0:
-                bb_width = (bb_upper - bb_lower) / mid
+        if len(closes) >= bb_period:
+            window = list(closes)[-bb_period:]
+            bb_mid = _sma(window)
+            sd = _std(window)
+            if bb_mid is not None and sd is not None:
+                bb_upper = bb_mid + 2.0 * sd
+                bb_lower = bb_mid - 2.0 * sd
+                if bb_mid != 0:
+                    bb_width = (bb_upper - bb_lower) / abs(bb_mid)
 
-        # Volume ratio
-        vol_sma_window.append(volume)
-        vol_sma = None
-        vol_ratio = None
-        if len(vol_sma_window) == vol_sma_window.maxlen:
-            vol_sma = _sma(vol_sma_window)
-            if vol_sma and vol_sma != 0:
-                vol_ratio = volume / vol_sma
+        # Keltner channel (EMA mid + ATR*mult)
+        kc_upper = None
+        kc_lower = None
+        if kc_mid is not None and atr14 is not None:
+            kc_upper = float(kc_mid) + float(kc_mult) * float(atr14)
+            kc_lower = float(kc_mid) - float(kc_mult) * float(atr14)
 
-        # ATR / ADX
-        atr14 = None
-        adx14 = None
-        plus_di = None
-        minus_di = None
+        # Squeeze: Bollinger inside Keltner
+        squeeze_status = None
+        if bb_upper is not None and bb_lower is not None and kc_upper is not None and kc_lower is not None:
+            squeeze_status = 1 if (bb_upper < kc_upper and bb_lower > kc_lower) else 0
 
-        if prev_close is not None and prev_high is not None and prev_low is not None:
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-            up_move = high - prev_high
-            down_move = prev_low - low
-            plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
-            minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+        # RSI slope over 5 bars
+        rsi_slope5 = None
+        if rsi is not None and len(rsis) >= 6:
+            rsi_5 = list(rsis)[-6]
+            if rsi_5 is not None:
+                rsi_slope5 = float(rsi) - float(rsi_5)
 
-            tr_list.append(tr)
-            plus_dm_list.append(plus_dm)
-            minus_dm_list.append(minus_dm)
-
-            # Initial Wilder smoothing
-            if atr is None and len(tr_list) == atr_period:
-                atr = sum(tr_list) / float(atr_period)
-                plus_dm_s = sum(plus_dm_list) / float(atr_period)
-                minus_dm_s = sum(minus_dm_list) / float(atr_period)
-            elif atr is not None:
-                # Wilder smoothing update
-                atr = atr - (atr / atr_period) + tr
-                plus_dm_s = (plus_dm_s or 0.0) - ((plus_dm_s or 0.0) / atr_period) + plus_dm
-                minus_dm_s = (minus_dm_s or 0.0) - ((minus_dm_s or 0.0) / atr_period) + minus_dm
-
-            if atr is not None and atr != 0:
-                plus_di = 100.0 * (float(plus_dm_s or 0.0) / atr)
-                minus_di = 100.0 * (float(minus_dm_s or 0.0) / atr)
-                denom = plus_di + minus_di
-                if denom != 0:
-                    dx = 100.0 * abs(plus_di - minus_di) / denom
-                    dx_list.append(dx)
-
-                    if adx is None and len(dx_list) == adx_period:
-                        adx = sum(dx_list) / float(adx_period)
-                    elif adx is not None:
-                        adx = ((adx * (adx_period - 1)) + dx) / float(adx_period)
-
-        if atr is not None:
-            atr14 = float(atr)
-        if adx is not None:
-            adx14 = float(adx)
-
-        # Volatility (std of returns)
+        # ret std
         ret_std = None
-        if len(ret_window) >= 2:
-            ret_std = _std(ret_window)
+        if ret1 is not None and len(closes) >= vol_period + 1:
+            rets = []
+            cl = list(closes)[-(vol_period + 1):]
+            for j in range(1, len(cl)):
+                if cl[j-1] != 0:
+                    rets.append((cl[j] / cl[j-1]) - 1.0)
+            ret_std = _std(rets) if rets else None
 
         features: Dict[str, Any] = {
             "atr14": atr14,
@@ -226,14 +287,19 @@ def compute_features_for_bars(
             "bb_upper20": bb_upper,
             "bb_lower20": bb_lower,
             "bb_width20": bb_width,
+            "kc_mid20": kc_mid,
+            "kc_upper20": kc_upper,
+            "kc_lower20": kc_lower,
+            "squeeze_status": squeeze_status,
             "vol_sma20": vol_sma,
             "vol_ratio": vol_ratio,
             "mom10": mom,
             "ret1": ret1,
             "ret_std20": ret_std,
+            "rsi_slope5": rsi_slope5,
         }
 
-        out.append((int(b["open_time_ms"]), float(ema_fast), float(ema_slow), rsi, features))
+        out.append((ot, float(ema_fast or 0.0), float(ema_slow or 0.0), rsi, features))
 
         prev_close = close
         prev_high = high
@@ -310,9 +376,9 @@ def run_daily_archive(db: MariaDB, settings: Settings, metrics: Metrics, *, inst
     try:
         for src, dst, cols in [
             ("market_data", "market_data_history", "symbol,interval_minutes,open_time_ms,close_time_ms,open_price,high_price,low_price,close_price,volume,created_at"),
-            ("market_data_cache", "market_data_cache_history", "symbol,interval_minutes,open_time_ms,ema_fast,ema_slow,rsi,features_json,created_at"),
+            ("market_data_cache", "market_data_cache_history", "symbol,interval_minutes,open_time_ms,feature_version,ema_fast,ema_slow,rsi,features_json,created_at"),
             ("order_events", "order_events_history", "id,created_at,trace_id,service,exchange,symbol,client_order_id,exchange_order_id,event_type,side,qty,price,status,reason_code,reason,payload_json"),
-            ("trade_logs", "trade_logs_history", "id,created_at,trace_id,actor,symbol,side,qty,leverage,stop_dist_pct,stop_price,client_order_id,exchange_order_id,robot_score,ai_prob,open_reason_code,open_reason,close_reason_code,close_reason,entry_time_ms,exit_time_ms,entry_price,exit_price,pnl,features_json,label,status"),
+            ("trade_logs", "trade_logs_history", "id,created_at,trace_id,actor,symbol,side,qty,leverage,stop_dist_pct,stop_price,client_order_id,exchange_order_id,stop_client_order_id,stop_exchange_order_id,stop_order_type,robot_score,ai_prob,open_reason_code,open_reason,close_reason_code,close_reason,entry_time_ms,exit_time_ms,entry_price,exit_price,pnl,features_json,label,status,updated_at"),
             ("position_snapshots", "position_snapshots_history", "id,created_at,symbol,base_qty,avg_entry_price,meta_json"),
         ]:
             moved = _archive_table_timestamp(db, src=src, dst=dst, cutoff_days=90, trace_id=trace_id, columns=cols)
@@ -351,33 +417,35 @@ def enqueue_precompute_tasks(
     interval_minutes: int,
     open_times: List[int],
     trace_id: str,
+    feature_version: int = 1,
 ) -> int:
     if not open_times:
         return 0
-    rows = [(symbol, interval_minutes, int(ot), "PENDING", 0, None, trace_id) for ot in open_times]
+    fv = int(feature_version or 1)
+    rows = [(symbol, interval_minutes, int(ot), fv, "PENDING", 0, None, trace_id) for ot in open_times]
     with db.tx() as cur:
         cur.executemany(
             """
             INSERT IGNORE INTO precompute_tasks
-              (symbol, interval_minutes, open_time_ms, status, try_count, last_error, trace_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+              (symbol, interval_minutes, open_time_ms, feature_version, status, try_count, last_error, trace_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             rows,
         )
         return cur.rowcount or 0
 
-def _mark_tasks_done(db: MariaDB, *, symbol: str, interval_minutes: int, up_to_open_time_ms: int):
+def _mark_tasks_done(db: MariaDB, *, symbol: str, interval_minutes: int, feature_version: int, up_to_open_time_ms: int):
     with db.tx() as cur:
         cur.execute(
             """
             UPDATE precompute_tasks
             SET status='DONE'
-            WHERE symbol=%s AND interval_minutes=%s AND status='PENDING' AND open_time_ms <= %s
+            WHERE symbol=%s AND interval_minutes=%s AND feature_version=%s AND status='PENDING' AND open_time_ms <= %s
             """,
-            (symbol, interval_minutes, int(up_to_open_time_ms)),
+            (symbol, interval_minutes, int(feature_version or 1), int(up_to_open_time_ms)),
         )
 
-def _mark_tasks_error(db: MariaDB, *, symbol: str, interval_minutes: int, open_times: List[int], trace_id: str, err: str):
+def _mark_tasks_error(db: MariaDB, *, symbol: str, interval_minutes: int, feature_version: int, open_times: List[int], trace_id: str, err: str):
     if not open_times:
         return
     with db.tx() as cur:
@@ -386,9 +454,9 @@ def _mark_tasks_error(db: MariaDB, *, symbol: str, interval_minutes: int, open_t
                 """
                 UPDATE precompute_tasks
                 SET status='ERROR', try_count=try_count+1, last_error=%s, trace_id=%s
-                WHERE symbol=%s AND interval_minutes=%s AND open_time_ms=%s
+                WHERE symbol=%s AND interval_minutes=%s AND feature_version=%s AND open_time_ms=%s
                 """,
-                (err[:2000], trace_id, symbol, interval_minutes, int(ot)),
+                (err[:2000], trace_id, symbol, interval_minutes, int(feature_version or 1), int(ot)),
             )
 
 
@@ -405,11 +473,11 @@ def process_precompute_tasks(
     tasks = db.fetch_all(
         """
         SELECT open_time_ms FROM precompute_tasks
-        WHERE symbol=%s AND interval_minutes=%s AND status='PENDING'
+        WHERE symbol=%s AND interval_minutes=%s AND feature_version=%s AND status='PENDING'
         ORDER BY open_time_ms ASC
         LIMIT %s
         """,
-        (symbol, interval, int(max_tasks)),
+        (symbol, interval, int(settings.feature_version), int(max_tasks)),
     )
     if not tasks:
         return 0
@@ -448,6 +516,7 @@ def process_precompute_tasks(
                 symbol,
                 interval,
                 int(ot),
+                int(settings.feature_version),
                 ema_f,
                 ema_s,
                 rsi,
@@ -455,8 +524,91 @@ def process_precompute_tasks(
             )
         )
 
-    if not cache_rows:
-        return 0
+
+    # ---- V8.3: BTC correlation feature (best-effort) ----
+    if symbol != getattr(settings, "btc_symbol", "BTCUSDT"):
+        try:
+            btc_symbol = getattr(settings, "btc_symbol", "BTCUSDT")
+            ots = [int(r[2]) for r in cache_rows]  # (symbol, interval, ot, ...)
+            if ots:
+                min_cache_ot = int(min(ots))
+                max_cache_ot = int(max(ots))
+                btc_rows = db.fetch_all(
+                    """
+                    SELECT open_time_ms, close_price
+                    FROM market_data
+                    WHERE symbol=%s AND interval_minutes=%s AND open_time_ms BETWEEN %s AND %s
+                    ORDER BY open_time_ms ASC
+                    """,
+                    (btc_symbol, interval, min_cache_ot, max_cache_ot),
+                ) or []
+                btc_close_by_ot = {
+                    int(r["open_time_ms"]): float(r["close_price"])
+                    for r in btc_rows
+                    if r.get("open_time_ms") is not None and r.get("close_price") is not None
+                }
+
+                # compute btc ret1 per open_time_ms
+                btc_ret_by_ot = {}
+                prev_btc_close = None
+                for ot in sorted(btc_close_by_ot.keys()):
+                    c = btc_close_by_ot[ot]
+                    if prev_btc_close is not None and prev_btc_close != 0:
+                        btc_ret_by_ot[ot] = (c / prev_btc_close) - 1.0
+                    else:
+                        btc_ret_by_ot[ot] = None
+                    prev_btc_close = c
+
+                # build local series for symbol ret1 from existing rows
+                sym_ret_by_ot = {}
+                for r in cache_rows:
+                    try:
+                        f = json.loads(r[7] or "{}")
+                    except Exception:
+                        f = {}
+                    sym_ret_by_ot[int(r[2])] = f.get("ret1")
+
+                def _pearson(xs, ys):
+                    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+                    if len(pairs) < 20:
+                        return None
+                    xvals = [p[0] for p in pairs]
+                    yvals = [p[1] for p in pairs]
+                    mx = sum(xvals) / len(xvals)
+                    my = sum(yvals) / len(yvals)
+                    num = sum((x - mx) * (y - my) for x, y in pairs)
+                    denx = sum((x - mx) ** 2 for x in xvals)
+                    deny = sum((y - my) ** 2 for y in yvals)
+                    if denx <= 1e-18 or deny <= 1e-18:
+                        return None
+                    return float(num / ((denx ** 0.5) * (deny ** 0.5)))
+
+                # rolling correlation window
+                window = 96
+                ots_sorted = sorted(sym_ret_by_ot.keys())
+                corr_by_ot = {}
+                for i2, ot in enumerate(ots_sorted):
+                    start_i = max(0, i2 - window + 1)
+                    w_ots = ots_sorted[start_i : i2 + 1]
+                    xs = [sym_ret_by_ot.get(x) for x in w_ots]
+                    ys = [btc_ret_by_ot.get(x) for x in w_ots]
+                    corr_by_ot[ot] = _pearson(xs, ys)
+
+                cache_rows2 = []
+                for row in cache_rows:
+                    ot = int(row[2])
+                    try:
+                        feats = json.loads(row[7] or "{}")
+                    except Exception:
+                        feats = {}
+                    feats["btc_corr96"] = corr_by_ot.get(ot)
+                    cache_rows2.append(
+                        (row[0], row[1], row[2], row[3], row[4], row[5], row[6], json.dumps(feats, ensure_ascii=False))
+                    )
+                cache_rows = cache_rows2
+        except Exception:
+            # correlation is best-effort; ignore failures
+            pass
 
     trace_id = new_trace_id("precompute")
     try:
@@ -464,8 +616,8 @@ def process_precompute_tasks(
             cur.executemany(
                 """
                 INSERT INTO market_data_cache
-                  (symbol, interval_minutes, open_time_ms, ema_fast, ema_slow, rsi, features_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                  (symbol, interval_minutes, open_time_ms, feature_version, ema_fast, ema_slow, rsi, features_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                   ema_fast=VALUES(ema_fast),
                   ema_slow=VALUES(ema_slow),
@@ -474,14 +626,14 @@ def process_precompute_tasks(
                 """,
                 cache_rows,
             )
-        _mark_tasks_done(db, symbol=symbol, interval_minutes=interval, up_to_open_time_ms=max_ot)
+        _mark_tasks_done(db, symbol=symbol, interval_minutes=interval, feature_version=int(settings.feature_version), up_to_open_time_ms=max_ot)
 
         metrics.precompute_tasks_processed_total.labels(SERVICE, symbol, str(interval)).inc(len(open_times))
         metrics.feature_compute_seconds.labels(SERVICE, symbol).observe(time.time() - t0)
         return len(open_times)
     except Exception as e:
         metrics.precompute_errors_total.labels(SERVICE, symbol, str(interval)).inc()
-        _mark_tasks_error(db, symbol=symbol, interval_minutes=interval, open_times=open_times, trace_id=trace_id, err=str(e))
+        _mark_tasks_error(db, symbol=symbol, interval_minutes=interval, feature_version=int(settings.feature_version), open_times=open_times, trace_id=trace_id, err=str(e))
         logger.exception(f"precompute_error symbol={symbol} trace_id={trace_id} err={e}")
         return 0
 
@@ -518,7 +670,7 @@ def _fill_recent_gaps(db: MariaDB, ex, settings: Settings, metrics: Metrics, *, 
         WHERE symbol=%s AND interval_minutes=%s
         ORDER BY open_time_ms DESC LIMIT 600
         """,
-        (symbol, interval),
+        (symbol, interval, int(settings.feature_version)),
     )
     if len(recent) < 3:
         return 0
@@ -543,7 +695,7 @@ def _fill_recent_gaps(db: MariaDB, ex, settings: Settings, metrics: Metrics, *, 
                     missing_total += inserted
                     # enqueue tasks for inserted open_times
                     open_times = [int(k.open_time_ms) for k in kl]
-                    enq = enqueue_precompute_tasks(db, symbol=symbol, interval_minutes=interval, open_times=open_times, trace_id=trace_id)
+                    enq = enqueue_precompute_tasks(db, symbol=symbol, interval_minutes=interval, open_times=open_times, trace_id=trace_id, feature_version=int(settings.feature_version))
                     metrics.precompute_tasks_enqueued_total.labels(SERVICE, symbol, str(interval)).inc(enq)
                 # move cursor forward
                 cursor = cursor + limit * interval_ms
@@ -565,7 +717,7 @@ def sync_symbol_once(db: MariaDB, ex, settings: Settings, metrics: Metrics, tele
             WHERE symbol=%s AND interval_minutes=%s
             ORDER BY open_time_ms DESC LIMIT 1
             """,
-            (symbol, interval),
+            (symbol, interval, int(settings.feature_version)),
         )
         start_ms = int(last["open_time_ms"]) + interval_ms if last else None
 
@@ -585,21 +737,54 @@ def sync_symbol_once(db: MariaDB, ex, settings: Settings, metrics: Metrics, tele
         inserted = _insert_market_data(db, symbol=symbol, interval=interval, klines=klines)
         if inserted:
             open_times = [int(k.open_time_ms) for k in klines]
-            enq = enqueue_precompute_tasks(db, symbol=symbol, interval_minutes=interval, open_times=open_times, trace_id=trace_id)
+            enq = enqueue_precompute_tasks(db, symbol=symbol, interval_minutes=interval, open_times=open_times, trace_id=trace_id, feature_version=int(settings.feature_version))
             metrics.precompute_tasks_enqueued_total.labels(SERVICE, symbol, str(interval)).inc(enq)
 
         # Compute lag based on cache
         last_cache = db.fetch_one(
             """
             SELECT open_time_ms FROM market_data_cache
-            WHERE symbol=%s AND interval_minutes=%s
+            WHERE symbol=%s AND interval_minutes=%s AND feature_version=%s
             ORDER BY open_time_ms DESC LIMIT 1
             """,
-            (symbol, interval),
+            (symbol, interval, int(settings.feature_version)),
         )
         if last_cache:
-            lag = int(now_ms() - int(last_cache["open_time_ms"]))
+            last_open_ms = int(last_cache["open_time_ms"])
+            # lag measured as: now - bar_close_time
+            close_ms = last_open_ms + interval_ms
+            lag = int(max(0, now_ms() - close_ms))
             metrics.data_sync_lag_ms.labels(SERVICE, symbol, str(interval)).set(lag)
+
+            # Telegram alert when lag exceeds threshold (throttled)
+            try:
+                threshold_ms = int(float(getattr(settings, 'market_data_lag_alert_seconds', 120)) * 1000.0)
+                cooldown_s = float(getattr(settings, 'market_data_lag_alert_cooldown_seconds', 300))
+                now_ts = time.time()
+                last_ts = float(LAG_ALERT_LAST_AT.get(symbol, 0.0) or 0.0)
+                if threshold_ms > 0 and lag > threshold_ms and settings.is_telegram_enabled() and (now_ts - last_ts) >= cooldown_s:
+                    LAG_ALERT_LAST_AT[symbol] = now_ts
+                    summary = build_system_summary(
+                        event='DATA_LAG',
+                        trace_id=trace_id,
+                        level='WARN',
+                        actor=SERVICE,
+                        exchange=settings.exchange,
+                        reason_code='DATA_LAG',
+                        reason='market_data_cache lag exceeds threshold',
+                        extra={
+                            'symbol': symbol,
+                            'interval_minutes': interval,
+                            'feature_version': int(settings.feature_version),
+                            'lag_ms': lag,
+                            'threshold_ms': threshold_ms,
+                            'last_open_time_ms': last_open_ms,
+                            'last_close_time_ms': close_ms,
+                        },
+                    )
+                    send_system_alert(telegram, title='DATA_LAG', summary_kv=summary, payload={})
+            except Exception:
+                pass
 
         # gap fill on recent history
         _fill_recent_gaps(db, ex, settings, metrics, symbol=symbol, trace_id=trace_id)
@@ -611,15 +796,28 @@ def sync_symbol_once(db: MariaDB, ex, settings: Settings, metrics: Metrics, tele
         )
     except Exception as e:
         metrics.data_sync_errors_total.labels(SERVICE).inc()
+        try:
+            append_error_event(
+                db,
+                trace_id=trace_id,
+                service=SERVICE,
+                exchange=settings.exchange,
+                symbol=symbol,
+                reason=f"sync_error: {str(e)[:200]}",
+                payload={"error": str(e), "symbol": symbol, "interval": interval},
+                reason_code="DATA_SYNC",
+            )
+        except Exception:
+            pass
         upsert_heartbeat(db, instance_id, {"trace_id": trace_id, "status": "ERROR", "symbol": symbol, "error": str(e)})
         logger.exception(f"sync_error symbol={symbol} trace_id={trace_id} err={e}")
         telegram.send(f"[{SERVICE}] sync_error symbol={symbol} trace_id={trace_id} err={e}")
 
 
 def main():
-    settings = Settings()
+    settings = load_settings()
     db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
-    migrate(db, migrations_dir=str(Path(__file__).resolve().parents[2] / "migrations"))
+    migrate(db, Path(__file__).resolve().parents[2] / "migrations")
 
     metrics = Metrics(SERVICE)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
@@ -644,11 +842,21 @@ def main():
     )
     last_role: str = "unknown"
 
-    symbols = list(settings.symbols) if getattr(settings, "symbols", None) else [settings.symbol]
-    # safety: de-dupe
-    seen = set()
-    symbols = [s for s in symbols if not (s in seen or seen.add(s))]
-    logger.info(f"start service={SERVICE} exchange={settings.exchange} interval={settings.interval_minutes} symbols={symbols}")
+    runtime_cfg = RuntimeConfig.load(db, settings)
+    # update runtime config metrics (best-effort)
+    try:
+        metrics.runtime_config_symbols_count.labels(SERVICE).set(len(runtime_cfg.symbols))
+        metrics.runtime_config_last_refresh_ms.labels(SERVICE).set(runtime_cfg.last_refresh_ms)
+    except Exception:
+        pass
+
+    symbols = list(runtime_cfg.symbols)
+    logger.info(
+        f"start service={SERVICE} exchange={settings.exchange} interval={settings.interval_minutes} "
+        f"symbols={symbols} symbols_from_db={runtime_cfg.symbols_from_db} refresh_seconds={settings.runtime_config_refresh_seconds}"
+    )
+
+    next_cfg_refresh_ts = time.time() + float(settings.runtime_config_refresh_seconds)
 
     while True:
         # leader election: only leader performs sync/archive/precompute
@@ -679,12 +887,37 @@ def main():
             time.sleep(settings.leader_follower_sleep_seconds)
             continue
 
+        # Runtime config hot-reload (A2): refresh SYMBOLS/HALT/EMERGENCY flags
+        if time.time() >= next_cfg_refresh_ts:
+            try:
+                changes = runtime_cfg.refresh(db, settings)
+                metrics.runtime_config_refresh_total.labels(SERVICE).inc()
+                metrics.runtime_config_symbols_count.labels(SERVICE).set(len(runtime_cfg.symbols))
+                metrics.runtime_config_last_refresh_ms.labels(SERVICE).set(runtime_cfg.last_refresh_ms)
+                if "symbols" in changes:
+                    symbols = list(runtime_cfg.symbols)
+                    logger.info(
+                        f"runtime_config_symbols_updated symbols={symbols} symbols_from_db={runtime_cfg.symbols_from_db}"
+                    )
+            except Exception as e:
+                logger.warning(f"runtime_config_refresh_failed err={e}")
+            next_cfg_refresh_ts = time.time() + float(settings.runtime_config_refresh_seconds)
+
         metrics.data_sync_cycles_total.labels(SERVICE).inc()
         # daily archive
         run_daily_archive(db, settings, metrics, instance_id=instance_id)
 
         for sym in symbols:
-            sync_symbol_once(db, ex, settings, metrics, telegram, symbol=sym, instance_id=instance_id)
+            try:
+                sync_symbol_once(db, ex, settings, metrics, telegram, symbol=sym, instance_id=instance_id)
+            except RateLimitError as e:
+                sleep_s = e.retry_after_seconds or 2.0
+                try:
+                    telegram.send(f"[RATE_LIMIT] group={e.group} sleep={sleep_s:.2f}s severe={e.severe} sym={sym}")
+                except Exception:
+                    pass
+                time.sleep(max(0.5, float(sleep_s)))
+                continue
             # process a slice of precompute tasks per symbol each loop
             processed = process_precompute_tasks(db, settings, metrics, symbol=sym, max_tasks=800)
             if processed:

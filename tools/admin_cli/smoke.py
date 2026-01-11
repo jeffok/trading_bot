@@ -107,7 +107,7 @@ def run_smoke_test(
         c = _fetch_scalar(
             db,
             "SELECT COUNT(*) AS c FROM market_data WHERE symbol=%s AND interval_minutes=%s",
-            (settings.symbol, settings.interval_minutes),
+            (settings.symbol, settings.interval_minutes, int(getattr(settings,'feature_version',1))),
         )
         return bool(c and int(c) > 0)
 
@@ -117,7 +117,7 @@ def run_smoke_test(
         if ok:
             last = db.fetch_one(
                 "SELECT open_time_ms, close_time_ms, close_price FROM market_data WHERE symbol=%s AND interval_minutes=%s ORDER BY open_time_ms DESC LIMIT 1",
-                (settings.symbol, settings.interval_minutes),
+                (settings.symbol, settings.interval_minutes, int(getattr(settings,'feature_version',1))),
             )
             details["latest"] = last
         steps.append(StepResult("market_data_ready", ok, details))
@@ -128,8 +128,8 @@ def run_smoke_test(
     try:
         c = _fetch_scalar(
             db,
-            "SELECT COUNT(*) AS c FROM market_data_cache WHERE symbol=%s AND interval_minutes=%s",
-            (settings.symbol, settings.interval_minutes),
+            "SELECT COUNT(*) AS c FROM market_data_cache WHERE symbol=%s AND interval_minutes=%s AND feature_version=%s",
+            (settings.symbol, settings.interval_minutes, int(getattr(settings,'feature_version',1))),
         )
         ok = bool(c and int(c) > 0)
         steps.append(StepResult("market_data_cache_ready", ok, {"count": int(c or 0)}))

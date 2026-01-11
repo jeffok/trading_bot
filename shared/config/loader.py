@@ -96,6 +96,20 @@ class Settings:
     strategy_tick_seconds: int = int(os.getenv("STRATEGY_TICK_SECONDS", "900"))
     hard_stop_loss_pct: float = float(os.getenv("HARD_STOP_LOSS_PCT", "0.03"))
 
+    # Setup B (V8.3)
+    setup_b_adx_min: float = float(os.getenv("SETUP_B_ADX_MIN", "20"))
+    setup_b_vol_ratio_min: float = float(os.getenv("SETUP_B_VOL_RATIO_MIN", "1.5"))
+    setup_b_ai_score_min: float = float(os.getenv("SETUP_B_AI_SCORE_MIN", "55"))
+
+    # Risk budget / circuit breaker (V8.3)
+    account_equity_usdt: float = float(os.getenv("ACCOUNT_EQUITY_USDT", "500"))
+    risk_budget_pct: float = float(os.getenv("RISK_BUDGET_PCT", "0.03"))
+    max_drawdown_pct: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.15"))
+    circuit_window_seconds: int = int(os.getenv("CIRCUIT_WINDOW_SECONDS", "600"))
+    circuit_rate_limit_threshold: int = int(os.getenv("CIRCUIT_RATE_LIMIT_THRESHOLD", "8"))
+    circuit_failure_threshold: int = int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", "6"))
+    btc_symbol: str = os.getenv("BTC_SYMBOL", "BTCUSDT").upper()
+
     # 交易与风控（MVP 默认）
     max_concurrent_positions: int = int(os.getenv('MAX_CONCURRENT_POSITIONS', '3'))
     # 每单最小保证金（USDT）- 由策略侧反推 qty；名义价值通常为保证金*杠杆
@@ -114,10 +128,36 @@ class Settings:
     ai_l2: float = float(os.getenv("AI_L2", "0.000001"))
     ai_min_samples: int = int(os.getenv("AI_MIN_SAMPLES", "50"))
     ai_model_key: str = os.getenv("AI_MODEL_KEY", "AI_MODEL_V1")
+    ai_model_impl: str = os.getenv("AI_MODEL_IMPL", "online_lr").strip().lower()  # online_lr | sgd_compat
 
     # Drills / tests: run one cycle then exit
     run_once: bool = os.getenv("RUN_ONCE", "false").strip().lower() in ("1","true","yes","y")
 
+    # Runtime config refresh
+    runtime_config_refresh_seconds: int = int(os.getenv("RUNTIME_CONFIG_REFRESH_SECONDS", "30"))
+    use_protective_stop_order: bool = os.getenv("USE_PROTECTIVE_STOP_ORDER", "true").strip().lower() in ("1","true","yes","y")
+    stop_order_poll_seconds: int = int(os.getenv("STOP_ORDER_POLL_SECONDS", "10"))
+
+    # Control commands polling (V8.3): poll NEW commands every 1~3 seconds
+    control_poll_seconds: float = float(os.getenv("CONTROL_POLL_SECONDS", "2"))
+
+    # Feature cache versioning (V8.3)
+    feature_version: int = int(os.getenv("FEATURE_VERSION", "1"))
+
+    # Tick budget (V8.3): each tick should finish within ~10s
+    tick_budget_seconds: float = float(os.getenv("TICK_BUDGET_SECONDS", "10"))
+
+    # Position snapshots (V8.3): write snapshot every 5 minutes
+    position_snapshot_interval_seconds: int = int(os.getenv("POSITION_SNAPSHOT_INTERVAL_SECONDS", "300"))
+
+    # Distributed trade lock TTL (V8.3)
+    trade_lock_ttl_seconds: int = int(os.getenv("TRADE_LOCK_TTL_SECONDS", "30"))
+
+    # B2: protective stop abnormal handling
+    stop_arm_max_retries: int = int(os.getenv("STOP_ARM_MAX_RETRIES", "3"))
+    stop_arm_backoff_base_seconds: float = float(os.getenv("STOP_ARM_BACKOFF_BASE_SECONDS", "0.5"))
+    stop_rearm_max_attempts: int = int(os.getenv("STOP_REARM_MAX_ATTEMPTS", "2"))
+    stop_rearm_cooldown_seconds: int = int(os.getenv("STOP_REARM_COOLDOWN_SECONDS", "60"))
 
     admin_token: str = os.getenv("ADMIN_TOKEN", "change_me")
 
@@ -155,6 +195,10 @@ class Settings:
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # Data lag alerts (V8.3): send Telegram alert when cache lag exceeds threshold
+    market_data_lag_alert_seconds: float = float(os.getenv("MARKET_DATA_LAG_ALERT_SECONDS", "120"))
+    market_data_lag_alert_cooldown_seconds: float = float(os.getenv("MARKET_DATA_LAG_ALERT_COOLDOWN_SECONDS", "300"))
+
 
     # Observability / runtime identity
     # METRICS_PORT=0 means "auto" (service decides default) or disabled if service doesn't expose a metrics port.
@@ -182,3 +226,22 @@ class Settings:
 
     def is_telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+
+ALLOWED_EXCHANGES: set[str] = {"binance", "bybit", "paper"}
+
+
+def load_settings() -> Settings:
+    """Create Settings with basic validation.
+
+    Notes:
+    - 实盘运行时只会选择一个交易所（EXCHANGE=binance/bybit），不会同时连接多个交易所。
+      但仓库会同时包含多交易所适配层，供你通过配置切换。
+    """
+    s = Settings()
+    ex = (s.exchange or "").strip().lower()
+    if ex not in ALLOWED_EXCHANGES:
+        raise ValueError(
+            f"Invalid EXCHANGE={s.exchange!r}. Allowed: {', '.join(sorted(ALLOWED_EXCHANGES))}"
+        )
+    return s

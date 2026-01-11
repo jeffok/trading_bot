@@ -135,17 +135,51 @@ class Telegram:
         if not self.enabled():
             return
 
+        # 需求：每条告警必须包含 HK + UTC 时间戳（便于追溯）
+        kv = dict(summary_kv or {})
+        if "ts_hk" not in kv:
+            try:
+                from zoneinfo import ZoneInfo
+                kv["ts_hk"] = datetime.datetime.now(ZoneInfo("Asia/Hong_Kong")).isoformat()
+            except Exception:
+                kv["ts_hk"] = datetime.datetime.now().isoformat()
+        if "ts_utc" not in kv:
+            kv["ts_utc"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+        preferred = [
+            "ts_hk","ts_utc",
+            "level","service","event","action",
+            "trace_id",
+            "exchange","symbol","side",
+            "qty","price","leverage","ai_score",
+            "stop_price","stop_dist_pct",
+            "reason_code","reason",
+            "client_order_id","exchange_order_id",
+            "stop_client_order_id","stop_exchange_order_id",
+            "status","error",
+        ]
+
         lines: List[str] = []
-        for k, v in (summary_kv or {}).items():
+        used = set()
+        def _fmt(v: Any) -> Any:
             if isinstance(v, (datetime.datetime, datetime.date)):
-                v2 = v.isoformat()
-            elif isinstance(v, Decimal):
+                return v.isoformat()
+            if isinstance(v, Decimal):
                 try:
-                    v2 = float(v)
+                    return float(v)
                 except Exception:
-                    v2 = str(v)
-            else:
-                v2 = v
-            lines.append(f"- {k}: {v2}")
+                    return str(v)
+            return v
+
+        for k in preferred:
+            if k in kv:
+                lines.append(f"- {k}: {_fmt(kv.get(k))}")
+                used.add(k)
+
+        for k in sorted(kv.keys()):
+            if k in used:
+                continue
+            lines.append(f"- {k}: {_fmt(kv.get(k))}")
+
 
         self.send_alert(title=title, summary_lines=lines, payload=payload, json_indent=2)
