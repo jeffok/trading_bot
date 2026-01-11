@@ -670,7 +670,10 @@ def _fill_recent_gaps(db: MariaDB, ex, settings: Settings, metrics: Metrics, *, 
         WHERE symbol=%s AND interval_minutes=%s
         ORDER BY open_time_ms DESC LIMIT 600
         """,
-        (symbol, interval, int(settings.feature_version)),
+        # NOTE: market_data is not versioned by feature_version.
+        # Passing extra params will crash PyMySQL with:
+        #   "not all arguments converted during string formatting"
+        (symbol, interval),
     )
     if len(recent) < 3:
         return 0
@@ -717,7 +720,8 @@ def sync_symbol_once(db: MariaDB, ex, settings: Settings, metrics: Metrics, tele
             WHERE symbol=%s AND interval_minutes=%s
             ORDER BY open_time_ms DESC LIMIT 1
             """,
-            (symbol, interval, int(settings.feature_version)),
+            # NOTE: market_data is not versioned by feature_version.
+            (symbol, interval),
         )
         start_ms = int(last["open_time_ms"]) + interval_ms if last else None
 

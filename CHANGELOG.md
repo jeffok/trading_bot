@@ -183,6 +183,21 @@
 ## Iteration 10 Hotfix - 2026-01-11
 
 ### 修复
+- 修复 migrations runner 解析 `.sql` 时对注释中分号不兼容的问题：
+  - 迁移文件的注释行可能包含 `;`，原逻辑按 `;` 分割会把注释切碎并当作 SQL 执行，触发 MariaDB 1064。
+  - 现在在 split 前会先清理 `-- ...` 与 `/* ... */` 注释（轻量实现），再执行 SQL 语句列表。
+
+## Iteration 10 Hotfix2 - 2026-01-11
+
+### 修复
 - 修复 `get_instance_id()` 调用不一致导致 `api-service` 启动时报错：
   - 兼容 `get_instance_id(default)` 与 `get_instance_id(service, default)` 两种调用方式。
   - 避免 `TypeError: get_instance_id() takes from 0 to 1 positional arguments but 2 were given`。
+
+## Iteration 10 Hotfix3 - 2026-01-11
+
+### 修复
+- 修复 `data-syncer` 查询 `market_data` 时传参数量与 SQL 占位符不匹配导致循环报错：
+  - 现象：`sync_error ... err=not all arguments converted during string formatting`
+  - 原因：`market_data` 表不包含 `feature_version` 维度，但代码在 `WHERE symbol=%s AND interval_minutes=%s` 的查询中额外传入 `feature_version` 参数。
+  - 修复：移除多余参数，仅传 `(symbol, interval)`。
