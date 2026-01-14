@@ -2229,6 +2229,17 @@ def main():
                             settings=settings,
                         )
                         if not should_buy:
+                            # 记录为什么没有下单（仅在DEBUG级别或定期记录，避免日志过多）
+                            log_action(
+                                logger,
+                                action="SETUP_B_REJECT",
+                                trace_id=trace_id,
+                                reason_code=open_reason_code.value,
+                                reason=open_reason,
+                                symbol=symbol,
+                                ai_score=ai_score,
+                                client_order_id=None,
+                            )
                             continue
 
                         stop_dist_pct = float(settings.hard_stop_loss_pct)

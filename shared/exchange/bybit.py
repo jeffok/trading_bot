@@ -250,37 +250,75 @@ class BybitV5LinearClient(ExchangeClient):
                 ret_code = data.get("retCode")
                 ret_msg = data.get("retMsg", "Unknown error")
                 
-                # 针对retCode=10006（API密钥错误）提供详细错误信息和建议
+                # 针对retCode=10006：需要区分速率限制和API密钥错误
                 if ret_code == 10006 or str(ret_code) == "10006":
-                    error_details = [
-                        f"Bybit API error: {ret_msg} (retCode={ret_code})",
-                        "",
-                        "错误10006通常表示API密钥存在问题。请检查以下事项：",
-                        "1. 确认BYBIT_API_KEY环境变量已正确设置且不为空",
-                        "2. 确认API密钥没有前导或尾随空格（代码已自动清理）",
-                        "3. 确认API密钥格式正确（通常为字母数字字符串）",
-                        "4. 在Bybit平台上确认API密钥未被禁用或删除",
-                        "5. 确认API密钥具有执行所需操作的权限",
-                        "6. 检查服务器时间是否与标准时间同步（误差应在1秒内）",
-                        "",
-                        f"当前API密钥状态: length={len(self.api_key)}, "
-                        f"prefix={self.api_key[:4] if len(self.api_key) >= 4 else 'N/A'}***",
-                        f"请求路径: {path}, 方法: {method}, 是否需要签名: {signed}",
-                    ]
-                    error_msg = "\n".join(error_details)
-                    _logger.error(
-                        f"Bybit retCode=10006: {ret_msg}",
-                        extra={
-                            "retCode": ret_code,
-                            "retMsg": ret_msg,
-                            "path": path,
-                            "method": method,
-                            "signed": signed,
-                            "api_key_length": len(self.api_key),
-                            "api_key_prefix": self.api_key[:4] if len(self.api_key) >= 4 else "N/A",
-                        }
+                    ret_msg_lower = ret_msg.lower()
+                    # 检查是否是速率限制错误
+                    is_rate_limit = any(
+                        keyword in ret_msg_lower
+                        for keyword in [
+                            "rate limit",
+                            "too many visits",
+                            "exceeded",
+                            "too many requests",
+                            "frequency limit",
+                        ]
                     )
-                    raise ExchangeError(error_msg)
+                    
+                    if is_rate_limit:
+                        # 速率限制错误：抛出 RateLimitError 以便正确退避和重试
+                        _logger.warning(
+                            f"Bybit rate limit (retCode=10006): {ret_msg}",
+                            extra={
+                                "retCode": ret_code,
+                                "retMsg": ret_msg,
+                                "path": path,
+                                "method": method,
+                                "signed": signed,
+                                "budget": budget,
+                            }
+                        )
+                        # 使用自适应退避策略
+                        decision = self.limiter.feedback_rate_limited(
+                            budget, retry_after_seconds=None, status_code=429
+                        )
+                        raise RateLimitError(
+                            message=f"{ret_msg} (retCode={ret_code})",
+                            retry_after_seconds=decision.get("backoff_seconds"),
+                            group=budget,
+                            severe=bool(decision.get("severe")),
+                        )
+                    else:
+                        # API密钥错误：提供详细的错误信息和建议
+                        error_details = [
+                            f"Bybit API error: {ret_msg} (retCode={ret_code})",
+                            "",
+                            "错误10006通常表示API密钥存在问题。请检查以下事项：",
+                            "1. 确认BYBIT_API_KEY环境变量已正确设置且不为空",
+                            "2. 确认API密钥没有前导或尾随空格（代码已自动清理）",
+                            "3. 确认API密钥格式正确（通常为字母数字字符串）",
+                            "4. 在Bybit平台上确认API密钥未被禁用或删除",
+                            "5. 确认API密钥具有执行所需操作的权限",
+                            "6. 检查服务器时间是否与标准时间同步（误差应在1秒内）",
+                            "",
+                            f"当前API密钥状态: length={len(self.api_key)}, "
+                            f"prefix={self.api_key[:4] if len(self.api_key) >= 4 else 'N/A'}***",
+                            f"请求路径: {path}, 方法: {method}, 是否需要签名: {signed}",
+                        ]
+                        error_msg = "\n".join(error_details)
+                        _logger.error(
+                            f"Bybit retCode=10006 (API key issue): {ret_msg}",
+                            extra={
+                                "retCode": ret_code,
+                                "retMsg": ret_msg,
+                                "path": path,
+                                "method": method,
+                                "signed": signed,
+                                "api_key_length": len(self.api_key),
+                                "api_key_prefix": self.api_key[:4] if len(self.api_key) >= 4 else "N/A",
+                            }
+                        )
+                        raise ExchangeError(error_msg)
                 else:
                     # 其他错误代码使用标准错误信息
                     error_msg = f"{ret_msg} (retCode={ret_code})"
