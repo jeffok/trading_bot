@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -17,6 +18,9 @@ from .types import Kline, OrderResult
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+_logger = logging.getLogger(__name__)
 
 
 class BybitV5LinearClient(ExchangeClient):
@@ -47,8 +51,56 @@ class BybitV5LinearClient(ExchangeClient):
         service_name: str = "unknown",
     ):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.api_secret = api_secret.encode("utf-8") if api_secret else b""
+        
+        # 清理和验证API密钥（去除前后空格）
+        api_key_original = api_key
+        api_secret_original = api_secret
+        self.api_key = (api_key or "").strip()
+        api_secret_cleaned = (api_secret or "").strip()
+        self.api_secret = api_secret_cleaned.encode("utf-8") if api_secret_cleaned else b""
+        
+        # 记录API密钥初始化状态（不泄露敏感信息）
+        if self.api_key:
+            key_prefix = self.api_key[:4] if len(self.api_key) >= 4 else "****"
+            key_length = len(self.api_key)
+            _logger.info(
+                f"Bybit API key initialized: prefix={key_prefix}***, length={key_length}, "
+                f"service={service_name}"
+            )
+            # 检查是否有空格被清理
+            if api_key_original != self.api_key:
+                _logger.warning(
+                    f"Bybit API key had leading/trailing whitespace removed. "
+                    f"Original length={len(api_key_original)}, cleaned length={key_length}"
+                )
+        else:
+            _logger.warning(
+                f"Bybit API key is empty. This may cause retCode=10006 errors for signed requests. "
+                f"service={service_name}"
+            )
+        
+        # 验证API密钥格式（Bybit API密钥通常是字母数字字符串）
+        if self.api_key and not self.api_key.replace("-", "").replace("_", "").isalnum():
+            _logger.warning(
+                f"Bybit API key contains unusual characters. "
+                f"This may cause authentication issues (retCode=10006). "
+                f"prefix={self.api_key[:4] if len(self.api_key) >= 4 else '****'}***"
+            )
+        
+        # 验证API密钥长度（Bybit API密钥通常有一定长度）
+        if self.api_key and len(self.api_key) < 10:
+            _logger.warning(
+                f"Bybit API key seems too short (length={len(self.api_key)}). "
+                f"This may cause retCode=10006 errors. "
+                f"Please verify your BYBIT_API_KEY environment variable."
+            )
+        
+        if not api_secret_cleaned:
+            _logger.warning(
+                f"Bybit API secret is empty. This will cause authentication failures for signed requests. "
+                f"service={service_name}"
+            )
+        
         self.recv_window = int(recv_window)
         self.leverage = int(leverage)
         self.position_idx = int(position_idx)
@@ -128,6 +180,18 @@ class BybitV5LinearClient(ExchangeClient):
                     else:
                         resp = client.request(method, url, params=send_params, headers=headers, json=json_body)
 
+            # 记录请求详情（用于调试）
+            _logger.debug(
+                f"Bybit request: {method} {path}",
+                extra={
+                    "method": method,
+                    "path": path,
+                    "signed": signed,
+                    "status_code": resp.status_code,
+                    "budget": budget,
+                }
+            )
+
             if resp.status_code in (429, 418):
                 retry_after = None
                 ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
@@ -144,17 +208,92 @@ class BybitV5LinearClient(ExchangeClient):
                     severe=bool(decision.get("severe")),
                 )
             if resp.status_code in (401, 403):
-                raise AuthError(resp.text[:200])
+                error_text = resp.text[:200]
+                _logger.error(
+                    f"Bybit authentication error: {error_text}",
+                    extra={
+                        "status_code": resp.status_code,
+                        "path": path,
+                        "method": method,
+                        "signed": signed,
+                    }
+                )
+                raise AuthError(error_text)
             if resp.status_code >= 500:
-                raise TemporaryError(resp.text[:200])
+                error_text = resp.text[:200]
+                _logger.warning(
+                    f"Bybit server error: {error_text}",
+                    extra={
+                        "status_code": resp.status_code,
+                        "path": path,
+                        "method": method,
+                    }
+                )
+                raise TemporaryError(error_text)
             if resp.status_code >= 400:
-                raise ExchangeError(resp.text[:200])
+                error_text = resp.text[:200]
+                _logger.warning(
+                    f"Bybit client error: {error_text}",
+                    extra={
+                        "status_code": resp.status_code,
+                        "path": path,
+                        "method": method,
+                        "signed": signed,
+                    }
+                )
+                raise ExchangeError(error_text)
 
             data = resp.json()
 
             # Bybit V5: retCode != 0 视为业务错误
             if isinstance(data, dict) and data.get("retCode") not in (0, "0", None):
-                raise ExchangeError(f"{data.get('retMsg')} (retCode={data.get('retCode')})")
+                ret_code = data.get("retCode")
+                ret_msg = data.get("retMsg", "Unknown error")
+                
+                # 针对retCode=10006（API密钥错误）提供详细错误信息和建议
+                if ret_code == 10006 or str(ret_code) == "10006":
+                    error_details = [
+                        f"Bybit API error: {ret_msg} (retCode={ret_code})",
+                        "",
+                        "错误10006通常表示API密钥存在问题。请检查以下事项：",
+                        "1. 确认BYBIT_API_KEY环境变量已正确设置且不为空",
+                        "2. 确认API密钥没有前导或尾随空格（代码已自动清理）",
+                        "3. 确认API密钥格式正确（通常为字母数字字符串）",
+                        "4. 在Bybit平台上确认API密钥未被禁用或删除",
+                        "5. 确认API密钥具有执行所需操作的权限",
+                        "6. 检查服务器时间是否与标准时间同步（误差应在1秒内）",
+                        "",
+                        f"当前API密钥状态: length={len(self.api_key)}, "
+                        f"prefix={self.api_key[:4] if len(self.api_key) >= 4 else 'N/A'}***",
+                        f"请求路径: {path}, 方法: {method}, 是否需要签名: {signed}",
+                    ]
+                    error_msg = "\n".join(error_details)
+                    _logger.error(
+                        f"Bybit retCode=10006: {ret_msg}",
+                        extra={
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                            "path": path,
+                            "method": method,
+                            "signed": signed,
+                            "api_key_length": len(self.api_key),
+                            "api_key_prefix": self.api_key[:4] if len(self.api_key) >= 4 else "N/A",
+                        }
+                    )
+                    raise ExchangeError(error_msg)
+                else:
+                    # 其他错误代码使用标准错误信息
+                    error_msg = f"{ret_msg} (retCode={ret_code})"
+                    _logger.warning(
+                        f"Bybit API error: {error_msg}",
+                        extra={
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                            "path": path,
+                            "method": method,
+                        }
+                    )
+                    raise ExchangeError(error_msg)
 
             self.limiter.feedback_ok(budget, headers=dict(resp.headers))
             return data
