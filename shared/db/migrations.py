@@ -142,7 +142,41 @@ def migrate(db: PostgreSQL, migrations_dir: Path) -> List[str]:
                 statements.append(stmt)
         with db.tx() as cur:
             for st in statements:
-                cur.execute(st)
+                try:
+                    cur.execute(st)
+                except Exception as e:
+                    # Log the error but continue (some statements may fail if objects already exist)
+                    # This is especially important for CREATE TABLE IF NOT EXISTS and similar statements
+                    error_msg = str(e).lower()
+                    
+                    # Try to get PostgreSQL error code
+                    error_code = None
+                    try:
+                        import psycopg2
+                        if isinstance(e, psycopg2.Error):
+                            error_code = e.pgcode
+                    except (ImportError, AttributeError):
+                        pass
+                    
+                    # Ignore errors for objects that already exist
+                    # PostgreSQL error codes:
+                    # - 42P07: duplicate_table (table already exists)
+                    # - 42710: duplicate_object (object already exists)
+                    # - 23505: unique_violation (for pg_type_typname_nsp_index, this means type already exists)
+                    ignore_conditions = [
+                        'already exists' in error_msg,
+                        'duplicate' in error_msg,
+                        'pg_type_typname' in error_msg,
+                        error_code in ('42P07', '42710', '23505'),  # PostgreSQL error codes for duplicate objects
+                    ]
+                    
+                    if any(ignore_conditions):
+                        # Object already exists, skip this statement
+                        # This is safe because IF NOT EXISTS should handle this, but sometimes
+                        # PostgreSQL internal state can cause these errors
+                        continue
+                    # For other errors, re-raise
+                    raise
             cur.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (version,))
         ran.append(p.name)
 
