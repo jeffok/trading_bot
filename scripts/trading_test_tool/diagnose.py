@@ -1,21 +1,14 @@
-#!/usr/bin/env python3
-"""诊断为什么没有下单的脚本。
+"""诊断为什么没有下单 - 集成到trading_test_tool
 
-检查：
-1. HALT_TRADING 状态
-2. Setup B 条件是否满足
-3. AI 选币逻辑
-4. 风控限制
-5. 市场数据是否正常
+⚠️ 仅在Docker中使用：
+    docker compose exec execution python -m scripts.trading_test_tool diagnose
 """
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from __future__ import annotations
 
-from shared.config.loader import load_settings
-from shared.db.mariadb import MariaDB
-from shared.domain.runtime_config import load_runtime_config
+from shared.config import Settings
+from shared.db import PostgreSQL
+from shared.domain.runtime_config import RuntimeConfig
 from services.strategy_engine.main import (
     setup_b_decision,
     last_two_cache,
@@ -30,7 +23,8 @@ from services.strategy_engine.main import (
 )
 from shared.exchange.factory import make_exchange
 
-def diagnose_symbol(db: MariaDB, settings, symbol: str):
+
+def diagnose_symbol(db: PostgreSQL, settings: Settings, symbol: str):
     """诊断单个交易对"""
     print(f"\n{'='*60}")
     print(f"诊断交易对: {symbol}")
@@ -41,7 +35,7 @@ def diagnose_symbol(db: MariaDB, settings, symbol: str):
     print(f"\n1. HALT状态: {halt_trading}")
     if halt_trading == "true":
         print("   ⚠️  交易已暂停！这是阻止下单的主要原因。")
-        print("   解决方法: 运行 'python -m tools.admin_cli resume --by admin --reason-code ADMIN_RESUME --reason \"恢复交易\"'")
+        print("   解决方法: 运行 'docker compose exec execution python -m scripts.trading_test_tool resume --by admin --reason-code ADMIN_RESUME --reason \"恢复交易\"'")
         return
     
     # 2. 检查市场数据
@@ -143,59 +137,61 @@ def diagnose_symbol(db: MariaDB, settings, symbol: str):
     except Exception as e:
         print(f"   ❌ 风控检查失败: {e}")
 
-def main():
-    settings = load_settings()
-    db = MariaDB(
-        settings.db_host,
-        settings.db_port,
-        settings.db_user,
-        settings.db_pass,
-        settings.db_name,
-    )
-    
-    runtime_cfg = load_runtime_config(db, settings)
-    
-    print("="*60)
-    print("交易系统诊断工具")
-    print("="*60)
-    print(f"\n交易所: {settings.exchange}")
-    print(f"交易对数量: {len(runtime_cfg.symbols)}")
-    print(f"交易对列表: {', '.join(runtime_cfg.symbols)}")
-    
-    # 全局检查
-    halt_trading = get_flag(db, "HALT_TRADING", "false")
-    emergency_exit = get_flag(db, "EMERGENCY_EXIT", "false")
-    
-    print(f"\n全局状态:")
-    print(f"  - HALT_TRADING: {halt_trading}")
-    print(f"  - EMERGENCY_EXIT: {emergency_exit}")
-    
-    if halt_trading == "true":
-        print(f"\n⚠️  交易已暂停！这是阻止所有下单的主要原因。")
-        print(f"解决方法: 运行 'python -m tools.admin_cli resume --by admin --reason-code ADMIN_RESUME --reason \"恢复交易\"'")
-        return
-    
-    # 诊断每个交易对
-    symbols = runtime_cfg.symbols or [settings.symbol]
-    for symbol in symbols[:5]:  # 只诊断前5个
-        try:
-            diagnose_symbol(db, settings, symbol)
-        except Exception as e:
-            print(f"\n❌ 诊断{symbol}时出错: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    print(f"\n{'='*60}")
-    print("诊断完成")
-    print(f"{'='*60}")
-    print("\n建议:")
-    print("1. 检查日志中的 'SetupB未满足' 信息，了解具体哪些条件不满足")
-    print("2. 检查AI选币逻辑，确保交易对被选中")
-    print("3. 如果Setup B条件太严格，可以考虑降低阈值:")
-    print(f"   - SETUP_B_ADX_MIN (当前: {settings.setup_b_adx_min})")
-    print(f"   - SETUP_B_VOL_RATIO_MIN (当前: {settings.setup_b_vol_ratio_min})")
-    print(f"   - SETUP_B_AI_SCORE_MIN (当前: {settings.setup_b_ai_score_min})")
-    print("4. 检查市场数据是否正常更新")
 
-if __name__ == "__main__":
-    main()
+def run_diagnose(settings: Settings, symbol: str | None = None) -> int:
+    """运行诊断工具"""
+    db = PostgreSQL(settings.postgres_url)
+    
+    try:
+        runtime_cfg = RuntimeConfig.load(db, settings)
+        
+        print("="*60)
+        print("交易系统诊断工具")
+        print("="*60)
+        print(f"\n交易所: {settings.exchange}")
+        print(f"交易对数量: {len(runtime_cfg.symbols)}")
+        print(f"交易对列表: {', '.join(runtime_cfg.symbols)}")
+        
+        # 全局检查
+        halt_trading = get_flag(db, "HALT_TRADING", "false")
+        emergency_exit = get_flag(db, "EMERGENCY_EXIT", "false")
+        
+        print(f"\n全局状态:")
+        print(f"  - HALT_TRADING: {halt_trading}")
+        print(f"  - EMERGENCY_EXIT: {emergency_exit}")
+        
+        if halt_trading == "true":
+            print(f"\n⚠️  交易已暂停！这是阻止所有下单的主要原因。")
+            print(f"解决方法: 运行 'docker compose exec execution python -m scripts.trading_test_tool resume --by admin --reason-code ADMIN_RESUME --reason \"恢复交易\"'")
+            return 0
+        
+        # 诊断每个交易对
+        symbols = [symbol] if symbol else (runtime_cfg.symbols or [settings.symbol])
+        for sym in symbols[:10]:  # 最多诊断10个
+            try:
+                diagnose_symbol(db, settings, sym)
+            except Exception as e:
+                print(f"\n❌ 诊断{sym}时出错: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"\n{'='*60}")
+        print("诊断完成")
+        print(f"{'='*60}")
+        print("\n建议:")
+        print("1. 检查日志中的 'SetupB未满足' 信息，了解具体哪些条件不满足")
+        print("2. 检查AI选币逻辑，确保交易对被选中")
+        print("3. 如果Setup B条件太严格，可以考虑降低阈值:")
+        print(f"   - SETUP_B_ADX_MIN (当前: {settings.setup_b_adx_min})")
+        print(f"   - SETUP_B_VOL_RATIO_MIN (当前: {settings.setup_b_vol_ratio_min})")
+        print(f"   - SETUP_B_AI_SCORE_MIN (当前: {settings.setup_b_ai_score_min})")
+        print("4. 检查市场数据是否正常更新")
+        
+        return 0
+    except Exception as e:
+        print(f"❌ 诊断失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()

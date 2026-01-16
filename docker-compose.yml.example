@@ -1,18 +1,16 @@
-
 services:
-  mariadb:
-    image: mariadb:11
+  postgres:
+    image: postgres:16
     environment:
-      MARIADB_DATABASE: ${DB_NAME}
-      MARIADB_USER: ${DB_USER}
-      MARIADB_PASSWORD: ${DB_PASS}
-      MARIADB_ROOT_PASSWORD: root_pass
+      POSTGRES_DB: trading_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
     ports:
-      - "3306:3306"
+      - "5432:5432"
     volumes:
-      - mariadb_data:/var/lib/mysql
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 20
@@ -27,6 +25,22 @@ services:
       timeout: 3s
       retries: 20
 
+  execution:
+    build:
+      context: .
+      dockerfile: services/api_service/Dockerfile
+    env_file: .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 用于运行trading_test_tool
+    volumes:
+      - .:/app
+
   api-service:
     build:
       context: .
@@ -35,7 +49,7 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      mariadb:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -46,7 +60,7 @@ services:
       dockerfile: services/data_syncer/Dockerfile
     env_file: .env
     depends_on:
-      mariadb:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -57,10 +71,10 @@ services:
       dockerfile: services/strategy_engine/Dockerfile
     env_file: .env
     depends_on:
-      mariadb:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
 
 volumes:
-  mariadb_data:
+  postgres_data:

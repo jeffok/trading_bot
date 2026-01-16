@@ -7,7 +7,7 @@ Design intent
 -------------
 This script is meant to be a practical *operator tool*:
 
-- Validate connectivity to MariaDB / Redis
+- Validate connectivity to PostgreSQL / Redis
 - Validate required tables exist and migrations applied
 - Validate market data pipeline is working (market_data / market_data_cache)
 - Validate critical invariants:
@@ -36,7 +36,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 from shared.config import Settings
-from shared.db import MariaDB
+from shared.db import PostgreSQL
 from shared.redis.client import redis_client
 from shared.logging.trace import new_trace_id
 from shared.domain.enums import OrderEventType, ReasonCode, Side
@@ -49,11 +49,11 @@ class StepResult:
     details: Dict[str, Any]
 
 def _sql_now_utc() -> str:
-    # For MariaDB: CURRENT_TIMESTAMP is UTC if server timezone configured;
+    # For PostgreSQL: CURRENT_TIMESTAMP is UTC if server timezone configured;
     # We don't rely on it for correctness, only for heartbeat freshness.
     return "CURRENT_TIMESTAMP"
 
-def _fetch_scalar(db: MariaDB, sql: str, params: tuple = ()) -> Optional[Any]:
+def _fetch_scalar(db: PostgreSQL, sql: str, params: tuple = ()) -> Optional[Any]:
     row = db.fetch_one(sql, params)
     if not row:
         return None
@@ -77,13 +77,21 @@ def run_smoke_test(
     trace_id = new_trace_id("smoke")
     steps: List[StepResult] = []
 
-    db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+    db = PostgreSQL(settings.postgres_url)
     r = redis_client(settings.redis_url)
 
     # 1) DB connectivity
     try:
         ok = db.ping()
-        steps.append(StepResult("db_ping", ok, {"db_host": settings.db_host, "db_name": settings.db_name}))
+        # 从postgres_url中提取信息用于显示
+        from urllib.parse import urlparse
+        parsed = urlparse(settings.postgres_url)
+        db_info = {
+            "db_host": parsed.hostname or "unknown",
+            "db_port": parsed.port or 5432,
+            "db_name": parsed.path.lstrip('/') if parsed.path else "unknown"
+        }
+        steps.append(StepResult("db_ping", ok, db_info))
     except Exception as e:
         steps.append(StepResult("db_ping", False, {"error": str(e)}))
 
@@ -96,7 +104,8 @@ def run_smoke_test(
 
     # 3) Tables existence (migrations)
     try:
-        cnt = _fetch_scalar(db, "SELECT COUNT(*) AS c FROM information_schema.tables WHERE table_schema=%s AND table_name='order_events'", (settings.db_name,))
+        # PostgreSQL: 使用current_database()获取当前数据库名
+        cnt = _fetch_scalar(db, "SELECT COUNT(*) AS c FROM information_schema.tables WHERE table_schema='public' AND table_name='order_events'", ())
         ok = bool(cnt and int(cnt) == 1)
         steps.append(StepResult("tables_exist", ok, {"order_events_table": bool(ok)}))
     except Exception as e:
@@ -184,10 +193,10 @@ def run_smoke_test(
     # 8) Admin flags write/read sanity (HALT_TRADING)
     try:
         # Direct DB write: same behavior as /admin/update_config path, but faster and deterministic for regression.
-        db.execute("INSERT INTO system_config(`key`,`value`) VALUES ('HALT_TRADING','true') ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)")
-        v1 = _fetch_scalar(db, "SELECT `value` FROM system_config WHERE `key`='HALT_TRADING'")
-        db.execute("INSERT INTO system_config(`key`,`value`) VALUES ('HALT_TRADING','false') ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)")
-        v2 = _fetch_scalar(db, "SELECT `value` FROM system_config WHERE `key`='HALT_TRADING'")
+        db.execute('INSERT INTO system_config("key","value") VALUES (%s,%s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"', ('HALT_TRADING', 'true'))
+        v1 = _fetch_scalar(db, 'SELECT "value" FROM system_config WHERE "key"=\'HALT_TRADING\'')
+        db.execute('INSERT INTO system_config("key","value") VALUES (%s,%s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"', ('HALT_TRADING', 'false'))
+        v2 = _fetch_scalar(db, 'SELECT "value" FROM system_config WHERE "key"=\'HALT_TRADING\'')
         steps.append(StepResult("admin_flag_halt_rw", (str(v1).lower()=="true" and str(v2).lower()=="false"), {"v1": v1, "v2": v2}))
     except Exception as e:
         steps.append(StepResult("admin_flag_halt_rw", False, {"error": str(e)}))
@@ -203,8 +212,8 @@ def run_smoke_test(
             """,
             (settings.symbol, 0.002, 100000.0, json.dumps({"trace_id": trace_id, "note": "smoke position"}, ensure_ascii=False)),
         )
-        db.execute("INSERT INTO system_config(`key`,`value`) VALUES ('EMERGENCY_EXIT','true') ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)")
-        start_id = _fetch_scalar(db, "SELECT IFNULL(MAX(id),0) AS mx FROM order_events")
+        db.execute('INSERT INTO system_config("key","value") VALUES (%s,%s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"', ('EMERGENCY_EXIT', 'true'))
+        start_id = _fetch_scalar(db, "SELECT COALESCE(MAX(id),0) AS mx FROM order_events")
         start_id = int(start_id or 0)
 
         def emergency_exit_done() -> bool:
@@ -238,7 +247,7 @@ def run_smoke_test(
             },
         ))
         # Always reset flag to prevent accidental continuous exits.
-        db.execute("INSERT INTO system_config(`key`,`value`) VALUES ('EMERGENCY_EXIT','false') ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)")
+        db.execute('INSERT INTO system_config("key","value") VALUES (%s,%s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"', ('EMERGENCY_EXIT', 'false'))
     except Exception as e:
         steps.append(StepResult("emergency_exit_e2e", False, {"error": str(e), "requires": "strategy-engine running"}))
 

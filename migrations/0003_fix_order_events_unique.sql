@@ -3,7 +3,7 @@
 -- New: UNIQUE (exchange, symbol, client_order_id, event_type)
 
 ALTER TABLE order_events
-  DROP INDEX uq_client_order;
+  DROP CONSTRAINT IF EXISTS uq_client_order;
 
 ALTER TABLE order_events
-  ADD UNIQUE KEY uq_client_order_event (exchange, symbol, client_order_id, event_type);
+  ADD CONSTRAINT uq_client_order_event UNIQUE (exchange, symbol, client_order_id, event_type);

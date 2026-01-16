@@ -18,11 +18,11 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 ### 方法2: 直接查询数据库
 
 ```bash
-# 如果使用Docker
-docker-compose exec mariadb mysql -u alpha -palpha_pass alpha_sniper < tools/check_no_orders_simple.sql
+# 如果使用Docker（使用trading_test_tool）
+docker compose exec execution python -m scripts.trading_test_tool query --sql "$(cat tools/check_no_orders_simple.sql)"
 
-# 或者直接连接
-mysql -h DB_HOST -u DB_USER -p DB_NAME < tools/check_no_orders_simple.sql
+# 或者直接连接PostgreSQL
+psql $POSTGRES_URL -f tools/check_no_orders_simple.sql
 ```
 
 ### 方法3: 检查Docker日志
@@ -53,8 +53,8 @@ curl -X POST http://localhost:8080/admin/resume \
     "reason": "恢复交易"
   }'
 
-# 或通过CLI
-python -m tools.admin_cli resume \
+# 或通过CLI（仅在Docker中使用）
+docker compose exec execution python -m scripts.trading_test_tool resume \
   --by admin \
   --reason-code ADMIN_RESUME \
   --reason "恢复交易"

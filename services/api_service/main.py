@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from shared.config import Settings, load_settings, ALLOWED_EXCHANGES
-from shared.db import MariaDB, migrate
+from shared.db import PostgreSQL, migrate
 from shared.redis import redis_client
 from shared.logging import get_logger, new_trace_id
 from shared.domain.time import HK
@@ -67,8 +67,8 @@ def _parse_symbols_list(raw: str) -> list[str]:
 
 
 
-def get_system_config(db: MariaDB, key: str, default: Optional[str] = None) -> Optional[str]:
-    row = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
+def get_system_config(db: PostgreSQL, key: str, default: Optional[str] = None) -> Optional[str]:
+    row = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (key,))
     return row["value"] if row else default
 
 
@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
     trace_id = new_trace_id("startup")
 
     try:
-        db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+        db = PostgreSQL(settings.postgres_url)
         ran = migrate(db, Path("/app/migrations"))
 
         tg_alert(
@@ -177,7 +177,7 @@ async def lifespan(app: FastAPI):
     instance_id = get_instance_id(SERVICE, settings.instance_id)
 
     def _hb_loop() -> None:
-        db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+        db = PostgreSQL(settings.postgres_url)
         started = time.time()
         while not stop_evt.is_set():
             try:
@@ -228,7 +228,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     settings = load_settings()
     trace_id = new_trace_id("api_exc")
     try:
-        db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+        db = PostgreSQL(settings.postgres_url)
         # use first effective symbol if available
         sym = (list(getattr(settings, "symbols", ()) or []) + [getattr(settings, "symbol", "")])[0] or "UNKNOWN"
         append_error_event(
@@ -255,8 +255,8 @@ def get_settings() -> Settings:
     return load_settings()
 
 
-def get_db(settings: Settings = Depends(get_settings)) -> MariaDB:
-    return MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+def get_db(settings: Settings = Depends(get_settings)) -> PostgreSQL:
+    return PostgreSQL(settings.postgres_url)
 
 
 def require_admin(request: Request, authorization: str = Header(default=""), settings: Settings = Depends(get_settings)) -> None:
@@ -279,7 +279,7 @@ def require_admin(request: Request, authorization: str = Header(default=""), set
 
 
 @app.get("/health")
-def health(settings: Settings = Depends(get_settings), db: MariaDB = Depends(get_db)) -> Dict[str, Any]:
+def health(settings: Settings = Depends(get_settings), db: PostgreSQL = Depends(get_db)) -> Dict[str, Any]:
     """Lightweight health endpoint (no admin auth).
     Includes: db ping, halt/emergency flags, last heartbeats, and market data lag for effective symbols.
     """
@@ -400,7 +400,7 @@ def metrics() -> PlainTextResponse:
 
 
 def write_system_config(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     actor: str,
     key: str,
@@ -409,11 +409,11 @@ def write_system_config(
     reason_code: str,
     reason: str,
 ) -> None:
-    old = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
+    old = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (key,))
     old_val = old["value"] if old else None
 
     db.execute(
-        "INSERT INTO system_config(`key`,`value`) VALUES (%s,%s) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)",
+        'INSERT INTO system_config("key","value") VALUES (%s,%s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"',
         (key, value),
     )
     db.execute(
@@ -428,7 +428,7 @@ def write_system_config(
 @app.get("/admin/status")
 def admin_status(
     settings: Settings = Depends(get_settings),
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("status")
@@ -565,7 +565,7 @@ def admin_status(
 def admin_halt(
     cmd: AdminMeta,
     settings: Settings = Depends(get_settings),
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("halt")
@@ -608,7 +608,7 @@ def admin_halt(
 def admin_resume(
     cmd: AdminMeta,
     settings: Settings = Depends(get_settings),
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("resume")
@@ -650,7 +650,7 @@ def admin_resume(
 def admin_emergency_exit(
     cmd: AdminMeta,
     settings: Settings = Depends(get_settings),
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("exit")
@@ -693,7 +693,7 @@ def admin_emergency_exit(
 def admin_update_config(
     cmd: AdminUpdateConfig,
     settings: Settings = Depends(get_settings),
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("cfg")
@@ -741,7 +741,7 @@ def admin_update_config(
 def admin_control_commands(
     status: str = "NEW",
     limit: int = 50,
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     """List control_commands for debugging/audit.
@@ -803,7 +803,7 @@ def admin_ai_models(
     model_name: str = "",
     current_only: bool = True,
     limit: int = 30,
-    db: MariaDB = Depends(get_db),
+    db: PostgreSQL = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     """List ai_models metadata.
@@ -819,7 +819,7 @@ def admin_ai_models(
         where.append("model_name=%s")
         params.append(mn)
     if current_only:
-        where.append("is_current=1")
+        where.append("is_current=TRUE")
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 

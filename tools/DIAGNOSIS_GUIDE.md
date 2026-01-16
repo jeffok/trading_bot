@@ -35,7 +35,7 @@ curl -X POST http://YOUR_API_HOST:8080/admin/resume \
   -d '{"by": "admin", "reason_code": "ADMIN_RESUME", "reason": "恢复交易"}'
 
 # 或通过CLI
-python -m tools.admin_cli resume --by admin --reason-code ADMIN_RESUME --reason "恢复交易"
+docker compose exec execution python -m scripts.trading_test_tool resume --by admin --reason-code ADMIN_RESUME --reason "恢复交易"
 ```
 
 ### 步骤2: 检查最近的订单事件

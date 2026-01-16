@@ -22,7 +22,7 @@
 
 ## 0.1 最小可验收交付（MVP）
 1) 三服务（strategy-engine / data-syncer / api-service）可通过 docker-compose 启动并运行  
-2) 外部依赖：你已有 MariaDB 与 Redis，本项目不负责安装，只负责连接、建表/升级表  
+2) 外部依赖：你已有 PostgreSQL 与 Redis，本项目不负责安装，只负责连接、建表/升级表  
 3) 支持：停开仓、恢复、紧急清仓、参数热更新（API + CLI 两条路径）  
 4) 订单事件流 order_events 记录完整：下单 → 提交 → 成交/撤单/拒单/异常  
 5) 必须有：智能节流（按交易所返回的 rate limit 动态调整）  
@@ -369,7 +369,7 @@ CLI 写操作必须同时写：
 
 ## Phase 0：工程骨架与本地可跑（0.5-1 周）
 - 代码仓库结构与基础脚手架（3 服务 + 公共库）
-- docker-compose 一键启动（MariaDB/Redis 作为外部依赖仅做连接配置）
+- docker-compose 一键启动（PostgreSQL/Redis 作为外部依赖仅做连接配置）
 - 基础配置系统（env + system_config 读取）与时区规范（TZ=Asia/Hong_Kong，DB 用 UTC）
 - 基础日志框架（结构化日志）与 trace_id 贯穿
 
@@ -529,7 +529,7 @@ alpha-sniper-v8/
 - `shared/domain/events.py`：order_events 事件类型、写入约束、reason 字段模型  
 - `services/strategy_engine/reconciler.py`：启动/定时对账未终态订单，补写 RECONCILED（最小实现）  
 - `services/data_syncer/archival.py`：archive_audit + history 表迁移（分批事务、可重试幂等）  
-- `tools/admin_cli/commands/*`：所有写操作都必须带 by/reason_code/reason，并写审计/日志/Telegram（与 /admin 对齐）
+- `scripts/trading_test_tool/*`：所有写操作都必须带 by/reason_code/reason，并写审计/日志/Telegram（与 /admin 对齐）。⚠️ 仅在Docker中使用。
 
 ## 12.3 DB 迁移文件（建议命名）
 - `0001_init.sql`：建表（schema_migrations、service_status、system_config、config_audit、control_commands、order_events、trade_logs、position_snapshots、market_data、market_data_cache、archive_audit、ai_models 等）  

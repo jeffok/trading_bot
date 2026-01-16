@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from shared.config import Settings
-from shared.db import MariaDB
+from shared.db import PostgreSQL
 
 
 def _parse_bool(v: Optional[str], default: bool = False) -> bool:
@@ -82,11 +82,11 @@ class RuntimeConfig:
     last_refresh_ms: int = 0
 
     @staticmethod
-    def _fetch_keys(db: MariaDB, keys: Tuple[str, ...]) -> Dict[str, Optional[str]]:
+    def _fetch_keys(db: PostgreSQL, keys: Tuple[str, ...]) -> Dict[str, Optional[str]]:
         if not keys:
             return {}
         placeholders = ",".join(["%s"] * len(keys))
-        rows = db.fetch_all(f"SELECT `key`, `value` FROM system_config WHERE `key` IN ({placeholders})", keys)
+        rows = db.fetch_all(f'SELECT "key", "value" FROM system_config WHERE "key" IN ({placeholders})', keys)
         m: Dict[str, Optional[str]] = {k: None for k in keys}
         for r in rows or []:
             k = str(r.get("key") or "")
@@ -95,7 +95,7 @@ class RuntimeConfig:
         return m
 
     @classmethod
-    def load(cls, db: MariaDB, settings: Settings) -> "RuntimeConfig":
+    def load(cls, db: PostgreSQL, settings: Settings) -> "RuntimeConfig":
         m = cls._fetch_keys(
             db,
             (
@@ -128,7 +128,7 @@ class RuntimeConfig:
             last_refresh_ms=int(time.time() * 1000),
         )
 
-    def refresh(self, db: MariaDB, settings: Settings) -> Dict[str, Any]:
+    def refresh(self, db: PostgreSQL, settings: Settings) -> Dict[str, Any]:
         before = (
             self.symbols,
             self.symbols_from_db,

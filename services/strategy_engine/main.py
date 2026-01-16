@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from shared.config import Settings, load_settings
-from shared.db import MariaDB, migrate
+from shared.db import PostgreSQL, migrate
 from shared.exchange import make_exchange
 from shared.exchange.base import ExchangeClient
 from shared.exchange.errors import RateLimitError
@@ -53,7 +53,7 @@ def _event_type_from_status(status: str) -> OrderEventType:
 
 
 
-def reconcile_stale_orders(db: MariaDB, ex, *, exchange_name: str, max_age_seconds: int, metrics: Metrics, telegram: Telegram) -> int:
+def reconcile_stale_orders(db: PostgreSQL, ex, *, exchange_name: str, max_age_seconds: int, metrics: Metrics, telegram: Telegram) -> int:
     """Best-effort reconciliation: query exchange for stale orders.
 
     It scans orders whose latest event is CREATED/SUBMITTED and older than max_age_seconds, then:
@@ -202,7 +202,7 @@ def reconcile_stale_orders(db: MariaDB, ex, *, exchange_name: str, max_age_secon
 
     return fixed
 
-def apply_control_commands(db: MariaDB, telegram: Telegram, *, exchange: str | None, trace_id: str) -> None:
+def apply_control_commands(db: PostgreSQL, telegram: Telegram, *, exchange: str | None, trace_id: str) -> None:
     """Consume NEW control_commands and apply to system_config (minimal)."""
     cmds = fetch_new_control_commands(db, limit=50)
     for c in cmds:
@@ -256,14 +256,14 @@ def apply_control_commands(db: MariaDB, telegram: Telegram, *, exchange: str | N
             if cid > 0:
                 mark_control_command_processed(db, command_id=cid, status="ERROR")
 
-def get_flag(db: MariaDB, key: str, default: str = "false") -> str:
-    row = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
+def get_flag(db: PostgreSQL, key: str, default: str = "false") -> str:
+    row = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (key,))
     return (row["value"] if row else default).strip().lower()
 
-def set_flag(db: MariaDB, key: str, value: str) -> None:
-    db.execute("INSERT INTO system_config(`key`,`value`) VALUES (%s,%s) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)", (key, value))
+def set_flag(db: PostgreSQL, key: str, value: str) -> None:
+    db.execute('INSERT INTO system_config("key","value") VALUES (%s,%s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"', (key, value))
 
-def latest_cache(db: MariaDB, symbol: str, interval_minutes: int, feature_version: int = 1):
+def latest_cache(db: PostgreSQL, symbol: str, interval_minutes: int, feature_version: int = 1):
     return db.fetch_one(
         """
         SELECT m.open_time_ms, m.close_price, c.ema_fast, c.ema_slow, c.rsi, c.features_json
@@ -274,10 +274,10 @@ def latest_cache(db: MariaDB, symbol: str, interval_minutes: int, feature_versio
         ORDER BY m.open_time_ms DESC
         LIMIT 1
         """,
-        (symbol, interval_minutes, int(feature_version or 1)),
+        (int(feature_version or 1), symbol, interval_minutes),
     )
 
-def last_two_cache(db: MariaDB, symbol: str, interval_minutes: int, feature_version: int = 1):
+def last_two_cache(db: PostgreSQL, symbol: str, interval_minutes: int, feature_version: int = 1):
     """Return (latest, prev) cache rows. prev may be None."""
     rows = db.fetch_all(
         """
@@ -289,13 +289,13 @@ def last_two_cache(db: MariaDB, symbol: str, interval_minutes: int, feature_vers
         ORDER BY m.open_time_ms DESC
         LIMIT 2
         """,
-        (symbol, interval_minutes, int(feature_version or 1)),
+        (int(feature_version or 1), symbol, interval_minutes),
     ) or []
     latest = rows[0] if len(rows) >= 1 else None
     prev = rows[1] if len(rows) >= 2 else None
     return latest, prev
 
-def get_position(db: MariaDB, symbol: str):
+def get_position(db: PostgreSQL, symbol: str):
     return db.fetch_one(
         """
         SELECT id, created_at, base_qty, avg_entry_price, meta_json
@@ -306,7 +306,7 @@ def get_position(db: MariaDB, symbol: str):
         (symbol,),
     )
 
-def save_position(db: MariaDB, symbol: str, base_qty: float, avg_entry_price: Optional[float], meta: dict) -> None:
+def save_position(db: PostgreSQL, symbol: str, base_qty: float, avg_entry_price: Optional[float], meta: dict) -> None:
     db.execute(
         """
         INSERT INTO position_snapshots(symbol, base_qty, avg_entry_price, meta_json)
@@ -323,7 +323,7 @@ def _stop_client_order_id(base_open_client_order_id: str, seq: int = 1) -> str:
 
 
 def _append_stop_event(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     trace_id: str,
     exchange_name: str,
@@ -361,7 +361,7 @@ def _append_stop_event(
 def _arm_protective_stop_with_retry(
     *,
     exchange: ExchangeClient,
-    db: MariaDB,
+    db: PostgreSQL,
     metrics: Metrics,
     telegram: Telegram,
     settings: Settings,
@@ -550,7 +550,7 @@ def _arm_protective_stop_with_retry(
 def _cancel_protective_stop(
     *,
     exchange: ExchangeClient,
-    db: MariaDB,
+    db: PostgreSQL,
     symbol: str,
     trace_id: str,
     meta: dict,
@@ -607,7 +607,7 @@ def _cancel_protective_stop(
 def _ensure_protective_stop(
     *,
     exchange: ExchangeClient,
-    db: MariaDB,
+    db: PostgreSQL,
     metrics: Metrics,
     telegram: Telegram,
     settings: Settings,
@@ -881,7 +881,7 @@ def _vectorize_for_ai(latest: dict) -> tuple[list[float], dict]:
     return x, bundle
 
 
-def _load_ai_model(db: MariaDB, settings: Settings):
+def _load_ai_model(db: PostgreSQL, settings: Settings):
     """加载 AI 模型（支持 online_lr / sgd_compat）。"""
     dim = 12
     impl = (settings.ai_model_impl or 'online_lr').strip().lower()
@@ -915,7 +915,7 @@ def _load_ai_model(db: MariaDB, settings: Settings):
     return OnlineLogisticRegression(dim=dim, lr=float(settings.ai_lr), l2=float(settings.ai_l2))
 
 
-def _maybe_persist_ai_model(db: MariaDB, settings: Settings, model, *, trace_id: str, force: bool = False) -> None:
+def _maybe_persist_ai_model(db: PostgreSQL, settings: Settings, model, *, trace_id: str, force: bool = False) -> None:
     # Persist every 10 updates or on force.
     if not force and (int(model.seen) % 10) != 0:
         return
@@ -941,7 +941,7 @@ def _maybe_persist_ai_model(db: MariaDB, settings: Settings, model, *, trace_id:
 
 
 def _open_trade_log(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     trace_id: str,
     symbol: str,
@@ -993,7 +993,7 @@ def _open_trade_log(
 
 
 
-def _fetch_trade_stop_order(db: MariaDB, trade_id: int) -> dict:
+def _fetch_trade_stop_order(db: PostgreSQL, trade_id: int) -> dict:
     row = db.fetch_one(
         """
         SELECT stop_client_order_id, stop_exchange_order_id, stop_order_type
@@ -1010,7 +1010,7 @@ def _fetch_trade_stop_order(db: MariaDB, trade_id: int) -> dict:
 
 
 def _update_trade_stop_order(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     trade_id: int,
     stop_client_order_id: str | None,
@@ -1025,7 +1025,7 @@ def _update_trade_stop_order(
 
 
 def _update_trade_after_entry_fill(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     trade_id: int,
     entry_price: float | None,
@@ -1044,7 +1044,7 @@ def _update_trade_after_entry_fill(
         )
 
 
-def _find_open_trade_id(db: MariaDB, symbol: str, meta: dict) -> int:
+def _find_open_trade_id(db: PostgreSQL, symbol: str, meta: dict) -> int:
     try:
         tid = int(meta.get("trade_id") or 0)
         if tid > 0:
@@ -1056,7 +1056,7 @@ def _find_open_trade_id(db: MariaDB, symbol: str, meta: dict) -> int:
 
 
 def _close_trade_and_train(
-    db: MariaDB,
+    db: PostgreSQL,
     settings: Settings,
     metrics: Metrics,
     model,
@@ -1384,7 +1384,7 @@ def min_qty_from_min_margin_usdt(min_margin_usdt: float, last_price: float, leve
     q_up = math.ceil(q * factor) / factor
     return float(q_up)
 
-def get_latest_positions_map(db: MariaDB, symbols: list[str]) -> dict[str, float]:
+def get_latest_positions_map(db: PostgreSQL, symbols: list[str]) -> dict[str, float]:
     """获取每个 symbol 最新持仓数量（base_qty）。"""
     if not symbols:
         return {}
@@ -1412,7 +1412,7 @@ def get_latest_positions_map(db: MariaDB, symbols: list[str]) -> dict[str, float
 def main():
     settings = load_settings()
     exchange = settings.exchange
-    db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+    db = PostgreSQL(settings.postgres_url)
     migrate(db, Path(__file__).resolve().parents[2] / "migrations")
 
     metrics = Metrics(SERVICE)
@@ -1522,7 +1522,7 @@ def main():
                             should_write = True
                             try:
                                 if created_at is not None:
-                                    # MariaDB returns datetime
+                                    # PostgreSQL returns datetime
                                     age = (datetime.datetime.utcnow() - created_at).total_seconds()
                                     should_write = age >= max(30.0, interval_s * 0.9)
                             except Exception:

@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
-from shared.db import MariaDB
+from shared.db import PostgreSQL
 
 
-def load_current_model_blob(db: MariaDB, *, model_name: str) -> Optional[Dict[str, Any]]:
+def load_current_model_blob(db: PostgreSQL, *, model_name: str) -> Optional[Dict[str, Any]]:
     """Load current model dict from ai_models (is_current=1)."""
     row = db.fetch_one(
         """
         SELECT id, model_name, version, metrics_json, blob
         FROM ai_models
-        WHERE model_name=%s AND is_current=1
+        WHERE model_name=%s AND is_current=TRUE
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -38,7 +38,7 @@ def load_current_model_blob(db: MariaDB, *, model_name: str) -> Optional[Dict[st
 
 
 def save_current_model_blob(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     model_name: str,
     version: str,
@@ -51,11 +51,11 @@ def save_current_model_blob(
         metrics_json = json.dumps(metrics or {}, ensure_ascii=False)
         with db.tx() as cur:
             cur.execute(
-                'UPDATE ai_models SET is_current=0 WHERE model_name=%s AND is_current=1',
+                'UPDATE ai_models SET is_current=FALSE WHERE model_name=%s AND is_current=TRUE',
                 (str(model_name),),
             )
             cur.execute(
-                'INSERT INTO ai_models(model_name, version, is_current, metrics_json, blob) VALUES (%s,%s,1,%s,%s)',
+                'INSERT INTO ai_models(model_name, version, is_current, metrics_json, blob) VALUES (%s,%s,TRUE,%s,%s)',
                 (str(model_name), str(version), metrics_json, payload),
             )
     except Exception:

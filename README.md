@@ -6,7 +6,7 @@
 - 三服务架构：`data-syncer` / `strategy-engine` / `api-service`
 - 交易所：支持 **Binance** 与 **Bybit**（运行时二选一，不会同时使用多个交易所）
 - 核心不变量：幂等下单（`client_order_id` / `orderLinkId`）、事件流 `order_events`、分布式锁、可观测性（/health /metrics）、可恢复（对账补写）
-- 数据：MariaDB（强一致事件与历史）、Redis（锁/速率限制状态）
+- 数据：PostgreSQL（强一致事件与历史，JSONB格式存储）、Redis（锁/速率限制状态）
 
 > ⚠️ 交易有风险。默认建议先使用 `EXCHANGE=paper`（纸交易）验证端到端流程，再切换真实交易所并设置较小仓位。
 
@@ -49,8 +49,8 @@ docker compose up --build
 
 - `shared/`：公共库（配置、日志、DB、Redis 锁、交易所网关、领域模型、指标与 Telegram）
 - `services/`：三个服务
-- `tools/admin_cli/`：命令行管理工具（可替代或补充 /admin）
-- `migrations/`：MariaDB 初始化与升级脚本（自动执行）
+- `scripts/trading_test_tool/`：命令行管理工具（仅在Docker中使用，可替代或补充 /admin）
+- `migrations/`：PostgreSQL 初始化与升级脚本（自动执行）
 
 ---
 
@@ -76,15 +76,24 @@ API 服务：`http://localhost:8080`
 
 ---
 
-## 6. Admin CLI（可选）
+## 6. Trading Test Tool（仅在Docker中使用）
 
 ```bash
-python -m tools.admin_cli status
-python -m tools.admin_cli halt --reason "maintenance"
-python -m tools.admin_cli resume --reason "ok"
+# 准备检查（检查配置、服务状态等）
+docker compose exec execution python -m scripts.trading_test_tool prepare
+
+# 查看系统状态
+docker compose exec execution python -m scripts.trading_test_tool status
+
+# 诊断为什么没有下单
+docker compose exec execution python -m scripts.trading_test_tool diagnose
+
+# 暂停/恢复交易
+docker compose exec execution python -m scripts.trading_test_tool halt --by admin --reason-code ADMIN_HALT --reason "maintenance"
+docker compose exec execution python -m scripts.trading_test_tool resume --by admin --reason-code ADMIN_RESUME --reason "ok"
 ```
 
-> CLI 会直接读写 MariaDB（等价于调用 /admin 的写入路径），同样会写审计与可选 Telegram。
+> ⚠️ 重要：此工具只能在Docker容器中使用。CLI 会直接读写 PostgreSQL（等价于调用 /admin 的写入路径），同样会写审计与可选 Telegram。
 
 ---
 

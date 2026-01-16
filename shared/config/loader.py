@@ -72,6 +72,27 @@ def _parse_csv_env(name: str, *, fallback: str = "", upper: bool = False) -> tup
     return tuple(parts)
 
 
+def _build_postgres_url() -> str:
+    """构建PostgreSQL连接URL（支持从旧MySQL参数自动转换）"""
+    # 优先使用POSTGRES_URL
+    postgres_url = os.getenv("POSTGRES_URL", "").strip()
+    if postgres_url:
+        return postgres_url
+    
+    # 向后兼容：从旧的MySQL参数构建PostgreSQL URL
+    db_host = os.getenv("DB_HOST", "").strip()
+    db_port = os.getenv("DB_PORT", "5432").strip()
+    db_user = os.getenv("DB_USER", "").strip()
+    db_pass = os.getenv("DB_PASS", "").strip()
+    db_name = os.getenv("DB_NAME", "").strip()
+    
+    if db_host and db_user and db_pass and db_name:
+        return f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+    
+    # 默认值
+    return "postgresql://postgres:password@postgres:5432/trading_bot"
+
+
 
 
 @dataclass(frozen=True)
@@ -137,6 +158,10 @@ class Settings:
     runtime_config_refresh_seconds: int = int(os.getenv("RUNTIME_CONFIG_REFRESH_SECONDS", "30"))
     use_protective_stop_order: bool = os.getenv("USE_PROTECTIVE_STOP_ORDER", "true").strip().lower() in ("1","true","yes","y")
     stop_order_poll_seconds: int = int(os.getenv("STOP_ORDER_POLL_SECONDS", "10"))
+    
+    # Data syncer optimization
+    data_sync_loop_interval_seconds: float = float(os.getenv("DATA_SYNC_LOOP_INTERVAL_SECONDS", "30"))
+    data_sync_symbol_delay_seconds: float = float(os.getenv("DATA_SYNC_SYMBOL_DELAY_SECONDS", "0.5"))
 
     # Control commands polling (V8.3): poll NEW commands every 1~3 seconds
     control_poll_seconds: float = float(os.getenv("CONTROL_POLL_SECONDS", "2"))
@@ -183,12 +208,9 @@ class Settings:
     leader_follower_sleep_seconds: int = int(os.getenv("LEADER_FOLLOWER_SLEEP_SECONDS", "2"))
 
     # DB / Redis（外部）
-    db_host: str = os.getenv("DB_HOST", "mariadb")
-    db_port: int = int(os.getenv("DB_PORT", "3306"))
-    db_user: str = os.getenv("DB_USER", "alpha")
-    db_pass: str = os.getenv("DB_PASS", "alpha_pass")
-    db_name: str = os.getenv("DB_NAME", "alpha_sniper")
-
+    # PostgreSQL连接URL（格式：postgresql://user:password@host:port/dbname）
+    postgres_url: str = field(default_factory=_build_postgres_url)
+    
     redis_url: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
     # Telegram

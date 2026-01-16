@@ -29,7 +29,7 @@
 
 ## 2. 数据库设计：高性能与审计 (Database Schema)
 
-采用 **MariaDB**，针对高频读写、审计溯源进行深度优化。
+采用 **PostgreSQL**，数据以JSONB格式存储，针对高频读写、审计溯源进行深度优化。
 
 ### 2.1 高性能存储 (Performance)
 * **分区表 (Partitioning):**

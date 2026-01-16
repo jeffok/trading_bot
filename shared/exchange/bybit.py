@@ -109,11 +109,31 @@ class BybitV5LinearClient(ExchangeClient):
         self.metrics = metrics
         self.service_name = service_name
 
-        self.limiter.ensure_budget("market_data", 10, 20)
-        self.limiter.ensure_budget("account", 5, 10)
-        self.limiter.ensure_budget("order", 5, 10)
+        # 优化后的速率限制预算配置（符合Bybit实际限制）
+        # 市场数据：保守配置（20个交易对，需要更谨慎）
+        # Bybit公开API相对宽松，但考虑到多交易对，设置为2 RPS
+        self.limiter.ensure_budget("market_data", 2, 5)      # 2 RPS, 5 burst
+        
+        # 账户查询：中等频率（Bybit支持50次/秒，但保守设置为3 RPS）
+        self.limiter.ensure_budget("account", 3, 6)          # 3 RPS, 6 burst
+        
+        # 订单操作：区分创建和查询
+        # 订单创建：Bybit限制10-20次/秒，保守设置为2 RPS
+        self.limiter.ensure_budget("order_create", 2, 4)     # 2 RPS, 4 burst
+        # 订单查询：Bybit支持50次/秒，设置为5 RPS
+        self.limiter.ensure_budget("order_query", 5, 10)     # 5 RPS, 10 burst
+        # 向后兼容：order预算使用order_create
+        self.limiter.ensure_budget("order", 2, 4)             # 向后兼容
 
         self._prepared_symbols: set[str] = set()
+        
+        # 查询接口缓存（借鉴trading-ci最佳实践）
+        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache_ttl = {
+            "wallet_balance": 1.0,      # 1秒缓存
+            "position_list": 1.0,       # 1秒缓存
+            "order_status": 0.5,        # 0.5秒缓存
+        }
 
     # -------------------------
     # Bybit V5 签名
@@ -122,6 +142,96 @@ class BybitV5LinearClient(ExchangeClient):
         # v5: prehash = timestamp + api_key + recv_window + payload
         pre = f"{ts_ms}{self.api_key}{self.recv_window}{payload}"
         return hmac.new(self.api_secret, pre.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _cache_get(self, key: str, ttl_sec: float) -> Optional[Dict[str, Any]]:
+        """获取缓存数据（借鉴trading-ci）"""
+        try:
+            ts, val = self._cache.get(key, (0.0, {}))
+            if not val:
+                return None
+            if (time.time() - float(ts)) <= float(ttl_sec):
+                return val
+            return None
+        except Exception:
+            return None
+
+    def _cache_set(self, key: str, val: Dict[str, Any]) -> None:
+        """设置缓存数据（借鉴trading-ci）"""
+        try:
+            self._cache[key] = (time.time(), val)
+        except Exception:
+            pass
+
+    def _parse_rate_limit_headers(self, headers: Dict[str, Any]) -> Dict[str, Any]:
+        """解析Bybit速率限制响应头（借鉴trading-ci）
+        
+        返回：
+        - remaining: 剩余请求次数
+        - limit: 总限制次数
+        - reset_timestamp_ms: 重置时间戳（毫秒）
+        """
+        result = {
+            "remaining": None,
+            "limit": None,
+            "reset_timestamp_ms": None,
+        }
+        
+        # 转换为小写键的字典
+        headers_lower = {k.lower(): v for k, v in headers.items()}
+        
+        # X-Bapi-Limit-Status: 剩余次数
+        for k in ("x-bapi-limit-status", "x-bapi-limit-remaining"):
+            if k in headers_lower:
+                try:
+                    result["remaining"] = int(float(headers_lower[k]))
+                    break
+                except Exception:
+                    pass
+        
+        # X-Bapi-Limit: 总限制次数
+        for k in ("x-bapi-limit",):
+            if k in headers_lower:
+                try:
+                    result["limit"] = int(float(headers_lower[k]))
+                    break
+                except Exception:
+                    pass
+        
+        # X-Bapi-Limit-Reset-Timestamp: 重置时间戳
+        for k in ("x-bapi-limit-reset-timestamp",):
+            if k in headers_lower:
+                try:
+                    n = int(float(headers_lower[k]))
+                    # 如果是秒级时间戳，转换为毫秒
+                    if n < 10_000_000_000:
+                        n = n * 1000
+                    result["reset_timestamp_ms"] = n
+                    break
+                except Exception:
+                    pass
+        
+        return result
+
+    def _apply_rate_limit_headers(self, budget: str, headers: Dict[str, Any]) -> None:
+        """应用速率限制响应头，实现自适应调整（借鉴trading-ci）"""
+        try:
+            rl_info = self._parse_rate_limit_headers(headers)
+            remaining = rl_info.get("remaining")
+            limit = rl_info.get("limit")
+            
+            # 如果剩余次数很少，记录警告
+            if remaining is not None and remaining < 5:
+                _logger.warning(
+                    f"Bybit rate limit approaching: remaining={remaining}, "
+                    f"limit={limit}, budget={budget}, service={self.service_name}"
+                )
+            
+            # 如果接近限制，可以在这里实现自适应调整
+            # 当前limiter已经支持feedback_ok，会自动处理Retry-After
+            # 未来可以扩展limiter支持rate_multiplier（类似trading-ci）
+            
+        except Exception:
+            pass
 
     def _request(
         self,
@@ -132,6 +242,7 @@ class BybitV5LinearClient(ExchangeClient):
         json_body: Optional[Dict[str, Any]] = None,
         signed: bool,
         budget: str,
+        max_retries: int = 3,
     ) -> Any:
         url = f"{self.base_url}{path}"
         self.limiter.acquire(budget, 1.0)
@@ -170,173 +281,221 @@ class BybitV5LinearClient(ExchangeClient):
                 }
             )
 
-        try:
-            with httpx.Client(timeout=10) as client:
-                if method.upper() == "GET":
-                    resp = client.get(url, params=send_params, headers=headers)
-                else:
-                    if signed and body_bytes is not None:
-                        resp = client.request(method, url, params=send_params, headers=headers, content=body_bytes)
+        # 重试循环（借鉴trading-ci）
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                with httpx.Client(timeout=10) as client:
+                    if method.upper() == "GET":
+                        resp = client.get(url, params=send_params, headers=headers)
                     else:
-                        resp = client.request(method, url, params=send_params, headers=headers, json=json_body)
+                        if signed and body_bytes is not None:
+                            resp = client.request(method, url, params=send_params, headers=headers, content=body_bytes)
+                        else:
+                            resp = client.request(method, url, params=send_params, headers=headers, json=json_body)
 
-            # 记录请求详情（用于调试）
-            _logger.debug(
-                f"Bybit request: {method} {path}",
-                extra={
-                    "method": method,
-                    "path": path,
-                    "signed": signed,
-                    "status_code": resp.status_code,
-                    "budget": budget,
-                }
-            )
-
-            if resp.status_code in (429, 418):
-                retry_after = None
-                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
-                if ra:
-                    try:
-                        retry_after = float(ra)
-                    except Exception:
-                        retry_after = None
-                decision = self.limiter.feedback_rate_limited(budget, retry_after_seconds=retry_after, status_code=resp.status_code)
-                raise RateLimitError(
-                    message=resp.text[:200],
-                    retry_after_seconds=decision.get("backoff_seconds"),
-                    group=budget,
-                    severe=bool(decision.get("severe")),
-                )
-            if resp.status_code in (401, 403):
-                error_text = resp.text[:200]
-                _logger.error(
-                    f"Bybit authentication error: {error_text}",
+                # 记录请求详情（用于调试）
+                _logger.debug(
+                    f"Bybit request: {method} {path} (attempt {attempt}/{max_retries})",
                     extra={
-                        "status_code": resp.status_code,
-                        "path": path,
                         "method": method,
+                        "path": path,
                         "signed": signed,
-                    }
-                )
-                raise AuthError(error_text)
-            if resp.status_code >= 500:
-                error_text = resp.text[:200]
-                _logger.warning(
-                    f"Bybit server error: {error_text}",
-                    extra={
                         "status_code": resp.status_code,
-                        "path": path,
-                        "method": method,
+                        "budget": budget,
+                        "attempt": attempt,
                     }
                 )
-                raise TemporaryError(error_text)
-            if resp.status_code >= 400:
-                error_text = resp.text[:200]
-                _logger.warning(
-                    f"Bybit client error: {error_text}",
-                    extra={
-                        "status_code": resp.status_code,
-                        "path": path,
-                        "method": method,
-                        "signed": signed,
-                    }
-                )
-                raise ExchangeError(error_text)
 
-            data = resp.json()
-
-            # Bybit V5: retCode != 0 视为业务错误
-            if isinstance(data, dict) and data.get("retCode") not in (0, "0", None):
-                ret_code = data.get("retCode")
-                ret_msg = data.get("retMsg", "Unknown error")
-                
-                # 针对retCode=10006：需要区分速率限制和API密钥错误
-                if ret_code == 10006 or str(ret_code) == "10006":
-                    ret_msg_lower = ret_msg.lower()
-                    # 检查是否是速率限制错误
-                    is_rate_limit = any(
-                        keyword in ret_msg_lower
-                        for keyword in [
-                            "rate limit",
-                            "too many visits",
-                            "exceeded",
-                            "too many requests",
-                            "frequency limit",
-                        ]
+                if resp.status_code in (429, 418):
+                    retry_after = None
+                    ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                    if ra:
+                        try:
+                            retry_after = float(ra)
+                        except Exception:
+                            retry_after = None
+                    decision = self.limiter.feedback_rate_limited(budget, retry_after_seconds=retry_after, status_code=resp.status_code)
+                    # 速率限制错误：可重试
+                    if attempt < max_retries:
+                        sleep_s = decision.get("backoff_seconds", 1.5)
+                        time.sleep(sleep_s)
+                        continue
+                    raise RateLimitError(
+                        message=resp.text[:200],
+                        retry_after_seconds=decision.get("backoff_seconds"),
+                        group=budget,
+                        severe=bool(decision.get("severe")),
                     )
+                if resp.status_code in (401, 403):
+                    error_text = resp.text[:200]
+                    _logger.error(
+                        f"Bybit authentication error: {error_text}",
+                        extra={
+                            "status_code": resp.status_code,
+                            "path": path,
+                            "method": method,
+                            "signed": signed,
+                        }
+                    )
+                    raise AuthError(error_text)
+                if resp.status_code >= 500:
+                    # 服务器错误：可重试
+                    error_text = resp.text[:200]
+                    _logger.warning(
+                        f"Bybit server error: {error_text} (attempt {attempt}/{max_retries})",
+                        extra={
+                            "status_code": resp.status_code,
+                            "path": path,
+                            "method": method,
+                            "attempt": attempt,
+                        }
+                    )
+                    if attempt < max_retries:
+                        time.sleep(min(5.0, 0.5 * (2 ** (attempt - 1))))
+                        continue
+                    raise TemporaryError(error_text)
+                if resp.status_code >= 400:
+                    error_text = resp.text[:200]
+                    _logger.warning(
+                        f"Bybit client error: {error_text}",
+                        extra={
+                            "status_code": resp.status_code,
+                            "path": path,
+                            "method": method,
+                            "signed": signed,
+                        }
+                    )
+                    raise ExchangeError(error_text)
+
+                data = resp.json()
+
+                # Bybit V5: retCode != 0 视为业务错误
+                if isinstance(data, dict) and data.get("retCode") not in (0, "0", None):
+                    ret_code = data.get("retCode")
+                    ret_msg = data.get("retMsg", "Unknown error")
                     
-                    if is_rate_limit:
-                        # 速率限制错误：抛出 RateLimitError 以便正确退避和重试
-                        _logger.warning(
-                            f"Bybit rate limit (retCode=10006): {ret_msg}",
-                            extra={
-                                "retCode": ret_code,
-                                "retMsg": ret_msg,
-                                "path": path,
-                                "method": method,
-                                "signed": signed,
-                                "budget": budget,
-                            }
+                    # 针对retCode=10006：需要区分速率限制和API密钥错误
+                    if ret_code == 10006 or str(ret_code) == "10006":
+                        ret_msg_lower = ret_msg.lower()
+                        # 检查是否是速率限制错误
+                        is_rate_limit = any(
+                            keyword in ret_msg_lower
+                            for keyword in [
+                                "rate limit",
+                                "too many visits",
+                                "exceeded",
+                                "too many requests",
+                                "frequency limit",
+                            ]
                         )
-                        # 使用自适应退避策略
-                        decision = self.limiter.feedback_rate_limited(
-                            budget, retry_after_seconds=None, status_code=429
-                        )
-                        raise RateLimitError(
-                            message=f"{ret_msg} (retCode={ret_code})",
-                            retry_after_seconds=decision.get("backoff_seconds"),
-                            group=budget,
-                            severe=bool(decision.get("severe")),
-                        )
+                        
+                        if is_rate_limit:
+                            # 速率限制错误：可重试
+                            _logger.warning(
+                                f"Bybit rate limit (retCode=10006): {ret_msg}",
+                                extra={
+                                    "retCode": ret_code,
+                                    "retMsg": ret_msg,
+                                    "path": path,
+                                    "method": method,
+                                    "signed": signed,
+                                    "budget": budget,
+                                    "attempt": attempt,
+                                }
+                            )
+                            # 使用自适应退避策略
+                            decision = self.limiter.feedback_rate_limited(
+                                budget, retry_after_seconds=None, status_code=429
+                            )
+                            if attempt < max_retries:
+                                sleep_s = decision.get("backoff_seconds", 1.5)
+                                time.sleep(sleep_s)
+                                continue
+                            raise RateLimitError(
+                                message=f"{ret_msg} (retCode={ret_code})",
+                                retry_after_seconds=decision.get("backoff_seconds"),
+                                group=budget,
+                                severe=bool(decision.get("severe")),
+                            )
+                        else:
+                            # API密钥错误：不可重试，立即抛出
+                            error_details = [
+                                f"Bybit API error: {ret_msg} (retCode={ret_code})",
+                                "",
+                                "错误10006通常表示API密钥存在问题。请检查以下事项：",
+                                "1. 确认BYBIT_API_KEY环境变量已正确设置且不为空",
+                                "2. 确认API密钥没有前导或尾随空格（代码已自动清理）",
+                                "3. 确认API密钥格式正确（通常为字母数字字符串）",
+                                "4. 在Bybit平台上确认API密钥未被禁用或删除",
+                                "5. 确认API密钥具有执行所需操作的权限",
+                                "6. 检查服务器时间是否与标准时间同步（误差应在1秒内）",
+                                "",
+                                f"当前API密钥状态: length={len(self.api_key)}, "
+                                f"prefix={self.api_key[:4] if len(self.api_key) >= 4 else 'N/A'}***",
+                                f"请求路径: {path}, 方法: {method}, 是否需要签名: {signed}",
+                            ]
+                            error_msg = "\n".join(error_details)
+                            _logger.error(
+                                f"Bybit retCode=10006 (API key issue): {ret_msg}",
+                                extra={
+                                    "retCode": ret_code,
+                                    "retMsg": ret_msg,
+                                    "path": path,
+                                    "method": method,
+                                    "signed": signed,
+                                    "api_key_length": len(self.api_key),
+                                    "api_key_prefix": self.api_key[:4] if len(self.api_key) >= 4 else "N/A",
+                                }
+                            )
+                            raise ExchangeError(error_msg)
                     else:
-                        # API密钥错误：提供详细的错误信息和建议
-                        error_details = [
-                            f"Bybit API error: {ret_msg} (retCode={ret_code})",
-                            "",
-                            "错误10006通常表示API密钥存在问题。请检查以下事项：",
-                            "1. 确认BYBIT_API_KEY环境变量已正确设置且不为空",
-                            "2. 确认API密钥没有前导或尾随空格（代码已自动清理）",
-                            "3. 确认API密钥格式正确（通常为字母数字字符串）",
-                            "4. 在Bybit平台上确认API密钥未被禁用或删除",
-                            "5. 确认API密钥具有执行所需操作的权限",
-                            "6. 检查服务器时间是否与标准时间同步（误差应在1秒内）",
-                            "",
-                            f"当前API密钥状态: length={len(self.api_key)}, "
-                            f"prefix={self.api_key[:4] if len(self.api_key) >= 4 else 'N/A'}***",
-                            f"请求路径: {path}, 方法: {method}, 是否需要签名: {signed}",
-                        ]
-                        error_msg = "\n".join(error_details)
-                        _logger.error(
-                            f"Bybit retCode=10006 (API key issue): {ret_msg}",
+                        # 其他错误代码使用标准错误信息
+                        error_msg = f"{ret_msg} (retCode={ret_code})"
+                        _logger.warning(
+                            f"Bybit API error: {error_msg}",
                             extra={
                                 "retCode": ret_code,
                                 "retMsg": ret_msg,
                                 "path": path,
                                 "method": method,
-                                "signed": signed,
-                                "api_key_length": len(self.api_key),
-                                "api_key_prefix": self.api_key[:4] if len(self.api_key) >= 4 else "N/A",
                             }
                         )
                         raise ExchangeError(error_msg)
-                else:
-                    # 其他错误代码使用标准错误信息
-                    error_msg = f"{ret_msg} (retCode={ret_code})"
-                    _logger.warning(
-                        f"Bybit API error: {error_msg}",
-                        extra={
-                            "retCode": ret_code,
-                            "retMsg": ret_msg,
-                            "path": path,
-                            "method": method,
-                        }
-                    )
-                    raise ExchangeError(error_msg)
 
-            self.limiter.feedback_ok(budget, headers=dict(resp.headers))
-            return data
-        except httpx.TimeoutException as e:
-            raise TemporaryError(str(e)) from e
+                # 解析Bybit速率限制响应头并应用自适应调整
+                headers_dict = dict(resp.headers)
+                self._apply_rate_limit_headers(budget, headers_dict)
+                
+                self.limiter.feedback_ok(budget, headers=headers_dict)
+                return data
+                
+            except (RateLimitError, TemporaryError) as e:
+                # 可重试错误
+                last_exception = e
+                if attempt < max_retries:
+                    if isinstance(e, RateLimitError):
+                        sleep_s = e.retry_after_seconds or 1.5
+                    else:
+                        sleep_s = min(5.0, 0.5 * (2 ** (attempt - 1)))
+                    time.sleep(sleep_s)
+                    continue
+                raise
+            except (AuthError, ExchangeError) as e:
+                # 不可重试错误，立即抛出
+                raise
+            except httpx.TimeoutException as e:
+                # 超时错误：可重试
+                last_exception = TemporaryError(str(e))
+                if attempt < max_retries:
+                    time.sleep(min(5.0, 0.5 * (2 ** (attempt - 1))))
+                    continue
+                raise TemporaryError(str(e)) from e
+        
+        # 所有重试都失败
+        if last_exception:
+            raise last_exception
+        raise ExchangeError("Request failed after retries")
 
     # -------------------------
     # 逐仓 + 杠杆（一次性准备）
@@ -433,11 +592,14 @@ class BybitV5LinearClient(ExchangeClient):
         if self.position_idx:
             payload["positionIdx"] = int(self.position_idx)
 
-        data_create = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="order")
+        data_create = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="order_create")
         result = (data_create or {}).get("result") or {}
         order_id = str(result.get("orderId", ""))
 
-        # 创建后立即轮询状态（短轮询 10s，确保拿到 FILLED/最终态）
+        # 优化后的订单状态轮询（使用指数退避，减少API请求）
+        # 初始延迟：订单创建后需要时间处理（Bybit通常需要100-500ms）
+        time.sleep(0.3)
+        
         status = "NEW"
         filled_qty = 0.0
         avg_price: Optional[float] = None
@@ -446,6 +608,9 @@ class BybitV5LinearClient(ExchangeClient):
 
         end = time.time() + 10.0
         last_status: Optional[OrderResult] = None
+        poll_interval = 0.3  # 初始间隔300ms
+        max_interval = 1.0   # 最大间隔1秒（指数退避上限）
+        
         while time.time() < end:
             st = self.get_order_status(symbol=symbol, client_order_id=client_order_id, exchange_order_id=order_id)
             last_status = st
@@ -463,9 +628,13 @@ class BybitV5LinearClient(ExchangeClient):
             except Exception:
                 pass
 
+            # 如果已成交或取消，立即退出（避免不必要的后续查询）
             if str(status).upper() in ("FILLED", "CANCELED", "CANCELLED", "REJECTED"):
                 break
-            time.sleep(0.2)
+            
+            # 指数退避：逐渐增加轮询间隔，减少API请求频率
+            time.sleep(poll_interval)
+            poll_interval = min(max_interval, poll_interval * 1.5)
 
         # 平仓 SELL：尽量从 closed-pnl 获取真实净盈亏与手续费（更可靠）
         fee2, pnl2 = self._fetch_closed_pnl(symbol=symbol, order_id=order_id, side=side_u)
@@ -494,11 +663,15 @@ class BybitV5LinearClient(ExchangeClient):
         if side != "SELL":
             return None, 0.0
 
-        deadline = time.time() + 12
+        # 优化：减少查询窗口，增加查询间隔，限制查询次数
+        deadline = time.time() + 15  # 增加到15秒超时
         end_ms = _now_ms()
-        start_ms = end_ms - 15 * 60_000  # 15 分钟窗口
+        start_ms = end_ms - 10 * 60_000  # 减少到10分钟窗口（更精确，减少数据量）
+        
+        query_count = 0
+        max_queries = 5  # 最多查询5次，避免无限循环
 
-        while time.time() < deadline:
+        while time.time() < deadline and query_count < max_queries:
             try:
                 data = self._request(
                     "GET",
@@ -513,8 +686,14 @@ class BybitV5LinearClient(ExchangeClient):
                     signed=True,
                     budget="account",
                 )
+                query_count += 1
             except ExchangeError:
                 data = None
+                query_count += 1
+
+            if not data:
+                time.sleep(0.5)  # 从0.3增加到0.5秒，减少API请求频率
+                continue
 
             lst = (((data or {}).get("result") or {}).get("list") or [])
             for row in lst:
@@ -535,7 +714,7 @@ class BybitV5LinearClient(ExchangeClient):
 
                     return fee, pnl
 
-            time.sleep(0.3)
+            time.sleep(0.5)  # 从0.3增加到0.5秒，减少API请求频率
 
         return None, None
 
@@ -573,7 +752,7 @@ class BybitV5LinearClient(ExchangeClient):
             payload["reduceOnly"] = True
             payload["closeOnTrigger"] = True
 
-        data = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="order")
+        data = self._request("POST", "/v5/order/create", json_body=payload, signed=True, budget="order_create")
         result = (data or {}).get("result") or {}
         order_id = str(result.get("orderId", ""))
 
@@ -586,26 +765,49 @@ class BybitV5LinearClient(ExchangeClient):
         elif exchange_order_id:
             payload["orderId"] = exchange_order_id
         try:
-            self._request("POST", "/v5/order/cancel", json_body=payload, signed=True, budget="order")
+            self._request("POST", "/v5/order/cancel", json_body=payload, signed=True, budget="order_create")
             return True
         except Exception:
             return False
 
 
     def get_order_status(self, *, symbol: str, client_order_id: str, exchange_order_id: Optional[str]) -> OrderResult:
-        """查询订单状态（Bybit V5）。
+        """查询订单状态（Bybit V5）- 带缓存优化。
 
         规则：
         - 优先 realtime（近期/活动订单）
         - realtime 查不到时 fallback history（已归档订单）
+        - 使用缓存减少API请求（借鉴trading-ci）
         """
+        # 构建缓存键
+        cache_key = f"order_status:{symbol}:{client_order_id}:{exchange_order_id or ''}"
+        ttl = self._cache_ttl.get("order_status", 0.5)
+        
+        # 尝试从缓存获取
+        cached = self._cache_get(cache_key, ttl)
+        if cached is not None:
+            # 从缓存数据重建OrderResult
+            try:
+                return OrderResult(
+                    exchange_order_id=cached.get("exchange_order_id"),
+                    status=cached.get("status"),
+                    filled_qty=cached.get("filled_qty", 0.0),
+                    avg_price=cached.get("avg_price"),
+                    fee_usdt=cached.get("fee_usdt"),
+                    pnl_usdt=cached.get("pnl_usdt"),
+                    raw=cached.get("raw", {}),
+                )
+            except Exception:
+                # 缓存数据损坏，继续查询
+                pass
+        
         params: Dict[str, Any] = {"category": "linear", "symbol": symbol}
         if exchange_order_id:
             params["orderId"] = exchange_order_id
         else:
             params["orderLinkId"] = client_order_id
 
-        data = self._request("GET", "/v5/order/realtime", params=params, signed=True, budget="order")
+        data = self._request("GET", "/v5/order/realtime", params=params, signed=True, budget="order_query")
         o: Dict[str, Any] = {}
         try:
             o = (((data.get("result") or {}).get("list") or [{}])[0]) or {}
@@ -613,7 +815,7 @@ class BybitV5LinearClient(ExchangeClient):
             o = {}
 
         if not o or not o.get("orderId"):
-            data2 = self._request("GET", "/v5/order/history", params=params, signed=True, budget="order")
+            data2 = self._request("GET", "/v5/order/history", params=params, signed=True, budget="order_query")
             try:
                 o = (((data2.get("result") or {}).get("list") or [{}])[0]) or {}
                 data = data2

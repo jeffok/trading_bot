@@ -7,7 +7,7 @@ import json
 from decimal import Decimal
 from typing import Any, Dict, Optional, Union
 
-from ..db.maria import MariaDB
+from ..db import PostgreSQL
 from .enums import OrderEventType, ReasonCode
 
 
@@ -63,7 +63,7 @@ def sanitize_payload(obj: Any, *, max_str_len: int = 2000, max_depth: int = 6, _
 
 
 def get_first_event_created_at(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     exchange: str,
     symbol: str,
@@ -84,7 +84,7 @@ def get_first_event_created_at(
 
 
 def append_order_event(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     trace_id: str,
     service: str,
@@ -155,7 +155,7 @@ def append_order_event(
 
 
 def append_error_event(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     trace_id: str,
     service: str,

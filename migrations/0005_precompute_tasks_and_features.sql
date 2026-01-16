@@ -1,10 +1,10 @@
 -- 0005_precompute_tasks_and_features.sql
 -- Milestone D: precompute queue + richer feature cache payload (JSON)
--- MariaDB 11+ recommended.
+-- PostgreSQL 16+ recommended.
 
 -- 1) Add features_json to market_data_cache (non-breaking)
 ALTER TABLE market_data_cache
-  ADD COLUMN IF NOT EXISTS features_json TEXT NULL;
+  ADD COLUMN IF NOT EXISTS features_json JSONB NULL;
 
 -- 2) Precompute task queue (idempotent)
 CREATE TABLE IF NOT EXISTS precompute_tasks (
@@ -16,11 +16,15 @@ CREATE TABLE IF NOT EXISTS precompute_tasks (
   last_error TEXT NULL,
   trace_id VARCHAR(64) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (symbol, interval_minutes, open_time_ms),
-  INDEX idx_precompute_status (status, symbol, interval_minutes, open_time_ms)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (symbol, interval_minutes, open_time_ms)
+);
 
+CREATE INDEX idx_precompute_status ON precompute_tasks(status, symbol, interval_minutes, open_time_ms);
+
+-- PostgreSQL: 使用触发器实现ON UPDATE CURRENT_TIMESTAMP
+CREATE TRIGGER update_precompute_tasks_updated_at BEFORE UPDATE ON precompute_tasks
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- 3) History table for market_data_cache (previous archive job expects it)
 CREATE TABLE IF NOT EXISTS market_data_cache_history (
@@ -30,10 +34,11 @@ CREATE TABLE IF NOT EXISTS market_data_cache_history (
   ema_fast DECIMAL(28, 12) NULL,
   ema_slow DECIMAL(28, 12) NULL,
   rsi DECIMAL(28, 12) NULL,
-  features_json TEXT NULL,
+  features_json JSONB NULL,
   created_at TIMESTAMP NOT NULL,
   archived_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (symbol, interval_minutes, open_time_ms),
-  INDEX idx_mdc_hist_symbol_time (symbol, interval_minutes, open_time_ms),
-  INDEX idx_mdc_hist_archived_at (archived_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  PRIMARY KEY (symbol, interval_minutes, open_time_ms)
+);
+
+CREATE INDEX idx_mdc_hist_symbol_time ON market_data_cache_history(symbol, interval_minutes, open_time_ms);
+CREATE INDEX idx_mdc_hist_archived_at ON market_data_cache_history(archived_at);

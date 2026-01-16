@@ -7,7 +7,9 @@ ALTER TABLE market_data_cache
 
 -- change primary key to include feature_version
 ALTER TABLE market_data_cache
-  DROP PRIMARY KEY,
+  DROP CONSTRAINT IF EXISTS market_data_cache_pkey;
+
+ALTER TABLE market_data_cache
   ADD PRIMARY KEY (symbol, interval_minutes, open_time_ms, feature_version);
 
 -- 2) market_data_cache_history
@@ -15,7 +17,9 @@ ALTER TABLE market_data_cache_history
   ADD COLUMN IF NOT EXISTS feature_version INT NOT NULL DEFAULT 1;
 
 ALTER TABLE market_data_cache_history
-  DROP PRIMARY KEY,
+  DROP CONSTRAINT IF EXISTS market_data_cache_history_pkey;
+
+ALTER TABLE market_data_cache_history
   ADD PRIMARY KEY (symbol, interval_minutes, open_time_ms, feature_version);
 
 -- 3) precompute_tasks
@@ -23,8 +27,10 @@ ALTER TABLE precompute_tasks
   ADD COLUMN IF NOT EXISTS feature_version INT NOT NULL DEFAULT 1;
 
 ALTER TABLE precompute_tasks
-  DROP PRIMARY KEY,
+  DROP CONSTRAINT IF EXISTS precompute_tasks_pkey;
+
+ALTER TABLE precompute_tasks
   ADD PRIMARY KEY (symbol, interval_minutes, open_time_ms, feature_version);
 
-CREATE INDEX idx_precompute_fv_status
+CREATE INDEX IF NOT EXISTS idx_precompute_fv_status
   ON precompute_tasks(feature_version, status, symbol, interval_minutes, open_time_ms);

@@ -6,13 +6,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List
 
 from shared.config import Settings
-from shared.db import MariaDB, migrate
+from shared.db import PostgreSQL, migrate
 from services.data_syncer.main import compute_features_for_bars
 
 
 def main() -> None:
     settings = Settings()
-    db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+    db = PostgreSQL(settings.postgres_url)
     migrate(db, migrations_dir="migrations")
 
     symbol = (settings.symbols[0] if settings.symbols else settings.symbol).upper()
@@ -78,8 +78,9 @@ def main() -> None:
         for b, c in zip(bars, feats):
             cur.execute(
                 """
-                INSERT IGNORE INTO market_data(symbol, interval_minutes, open_time_ms, close_time_ms, open_price, high_price, low_price, close_price, volume)
+                INSERT INTO market_data(symbol, interval_minutes, open_time_ms, close_time_ms, open_price, high_price, low_price, close_price, volume)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (symbol, interval_minutes, open_time_ms) DO NOTHING
                 """,
                 (
                     symbol,
@@ -95,8 +96,9 @@ def main() -> None:
             )
             cur.execute(
                 """
-                INSERT IGNORE INTO market_data_cache(symbol, interval_minutes, open_time_ms, ema_fast, ema_slow, rsi, features_json, created_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s, NOW())
+                INSERT INTO market_data_cache(symbol, interval_minutes, open_time_ms, feature_version, ema_fast, ema_slow, rsi, features_json, created_at)
+                VALUES (%s,%s,%s,1,%s,%s,%s,%s, CURRENT_TIMESTAMP)
+                ON CONFLICT (symbol, interval_minutes, open_time_ms, feature_version) DO NOTHING
                 """,
                 (
                     symbol,

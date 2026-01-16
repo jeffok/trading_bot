@@ -5,11 +5,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import List
-from .maria import MariaDB
+from .postgres import PostgreSQL
 
 MIGRATION_RE = re.compile(r"^(\d{4})_.*\.sql$")
 
-def migrate(db: MariaDB, migrations_dir: Path) -> List[str]:
+def migrate(db: PostgreSQL, migrations_dir: Path) -> List[str]:
     migrations_dir = migrations_dir.resolve()
     with db.tx() as cur:
         cur.execute(
@@ -17,7 +17,7 @@ def migrate(db: MariaDB, migrations_dir: Path) -> List[str]:
             CREATE TABLE IF NOT EXISTS schema_migrations (
               version VARCHAR(32) PRIMARY KEY,
               applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            )
             """
         )
 

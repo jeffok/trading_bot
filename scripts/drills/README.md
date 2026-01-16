@@ -34,10 +34,11 @@ bash scripts/drills/e2e_trade_cycle.sh
 
 
 ## DB 备份/恢复（里程碑 F）
-- `bash scripts/backup_db.sh`：导出并压缩到 `./backups/`
-- `bash scripts/restore_db.sh <file.sql.gz>`：从备份恢复
+- 使用PostgreSQL的pg_dump和pg_restore工具进行备份和恢复
+- 备份：`docker compose exec postgres pg_dump -U postgres trading_bot | gzip > backup.sql.gz`
+- 恢复：`gunzip -c backup.sql.gz | docker compose exec -T postgres psql -U postgres trading_bot`
 
-> 需要本机/容器内可用 `mysqldump` 与 `mysql` 客户端。生产环境建议在单独维护容器或运维机上运行。
+> 生产环境建议在单独维护容器或运维机上运行。
 
 
 ## A2: SYMBOLS 热更新演练

@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 """
-alpha-admin（管理小工具）
+Trading Test Tool - 交易系统管理工具（仅在Docker中使用）
 
-新增：
-- smoke-test：不下单，一键检查 DB/Redis/行情缓存是否更新
-- e2e-test：实盘闭环（BUY->SELL）并校验 SELL 的 pnl_usdt（交易所结算口径）
+⚠️ 重要：此工具只能在Docker容器中使用
+使用方式：
+    docker compose exec execution python -m scripts.trading_test_tool <command> [args...]
 
-修复：
-1) market_data_cache 表结构不一致：
-   - 不强依赖 close_time_ms
-   - SQL 用 SELECT * 避免 Unknown column
-   - age_seconds 优先 close_time_ms；否则 open_time_ms + interval 推算
-
-2) config_audit 字段名按现有表：
-   - INSERT config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
-
-3) JSON 序列化：
-   - report/payload 里可能有 Decimal / datetime
-   - 所有 json.dumps 都带 default=_json_default
+命令列表：
+    - prepare: 准备检查（检查配置、服务状态等）
+    - status: 查看系统状态
+    - diagnose: 诊断为什么没有下单
+    - check: 语法检查
+    - halt: 暂停交易
+    - resume: 恢复交易
+    - emergency-exit: 紧急退出
+    - set: 设置配置
+    - get: 获取配置
+    - list: 列出配置
+    - smoke-test: 链路自检
+    - e2e-test: 端到端测试
 """
 
 import argparse
@@ -30,7 +31,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from shared.config import Settings, load_settings
-from shared.db import MariaDB
+from shared.db import PostgreSQL
 from shared.exchange import make_exchange
 from shared.logging import new_trace_id
 from shared.redis import redis_client
@@ -57,7 +58,7 @@ def _json_default(o: Any) -> Any:
 # -----------------------------
 
 def write_system_config(
-        db: MariaDB,
+        db: PostgreSQL,
         *,
         actor: str,
         key: str,
@@ -67,15 +68,13 @@ def write_system_config(
         reason: str,
 ) -> None:
     """写 system_config，并记录 config_audit（用于审计/回溯）。"""
-    old = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
+    old = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (key,))
     old_val = old["value"] if old else None
 
     db.execute(
         """
-        INSERT INTO system_config(`key`, `value`)
-        VALUES (%s, %s) ON DUPLICATE KEY
-        UPDATE `value`=
-        VALUES (`value`)
+        INSERT INTO system_config("key", "value")
+        VALUES (%s, %s) ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value"
         """,
         (key, value),
     )
@@ -90,8 +89,8 @@ def write_system_config(
     )
 
 
-def read_system_config(db: MariaDB, key: str, default: str = "") -> str:
-    row = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
+def read_system_config(db: PostgreSQL, key: str, default: str = "") -> str:
+    row = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (key,))
     if not row:
         return default
     v = row.get("value")
@@ -149,7 +148,7 @@ def _calc_cache_age_seconds(row: Dict[str, Any], interval_minutes: int) -> Optio
 
 
 def _wait_for_market_cache(
-        db: MariaDB,
+        db: PostgreSQL,
         *,
         symbol: str,
         interval_minutes: int,
@@ -207,13 +206,7 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
         "checks": {},
     }
 
-    db = MariaDB(
-        host=settings.db_host,
-        port=settings.db_port,
-        user=settings.db_user,
-        password=settings.db_pass,
-        db=settings.db_name,
-    )
+    db = PostgreSQL(settings.postgres_url)
 
     # 1) DB
     try:
@@ -325,7 +318,7 @@ def run_e2e_trade_test(
     if ex in ("binance", "bybit") and not yes:
         print(
             "[E2E] 该命令会真实下单。为了避免误操作，必须加 --yes 才会执行。\n"
-            "示例：docker compose exec api-service python -m tools.admin_cli e2e-test --yes --qty 0.001",
+            "示例：docker compose exec execution python -m scripts.trading_test_tool e2e-test --yes --qty 0.001",
             file=sys.stderr,
         )
         return 2
@@ -342,13 +335,7 @@ def run_e2e_trade_test(
         print("[E2E] smoke-test 未通过，终止 e2e-test。", file=sys.stderr)
         return 2
 
-    db = MariaDB(
-        host=settings.db_host,
-        port=settings.db_port,
-        user=settings.db_user,
-        password=settings.db_pass,
-        db=settings.db_name,
-    )
+    db = PostgreSQL(settings.postgres_url)
 
     # 2) 暂停策略引擎，避免策略同时下单影响测试
     old_halt = read_system_config(db, "HALT_TRADING", "false")
@@ -472,7 +459,7 @@ def run_e2e_trade_test(
 def main() -> None:
     settings = load_settings()
 
-    parser = argparse.ArgumentParser(prog="alpha-admin")
+    parser = argparse.ArgumentParser(prog="trading-test-tool", description="交易系统管理工具（仅在Docker中使用）")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_status = sub.add_parser("status", help="查看系统状态（DB/Redis/缓存/开关）")
@@ -523,6 +510,14 @@ def main() -> None:
     p_e2e.add_argument("--sleep-after-entry", type=float, default=0.5)
     p_e2e.add_argument("--no-restore-halt", action="store_true")
 
+    p_diagnose = sub.add_parser("diagnose", help="诊断为什么没有下单")
+    p_diagnose.add_argument("--symbol", type=str, default=None, help="指定交易对（可选，默认诊断所有交易对）")
+
+    p_check = sub.add_parser("check", help="语法检查（compileall）")
+
+    p_query = sub.add_parser("query", help="执行SQL查询（仅用于调试）")
+    p_query.add_argument("--sql", type=str, required=True, help="SQL查询语句")
+
     args = parser.parse_args()
 
     if args.cmd == "set":
@@ -565,7 +560,7 @@ def main() -> None:
         return
 
     if args.cmd == "get":
-        row = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (args.key,))
+        row = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (args.key,))
         if not row:
             print("")
             return
@@ -577,12 +572,12 @@ def main() -> None:
         limit = int(args.limit or 200)
         if prefix:
             rows = db.fetch_all(
-                "SELECT `key`,`value`,updated_at FROM system_config WHERE `key` LIKE %s ORDER BY `key` ASC LIMIT %s",
+                'SELECT "key","value",updated_at FROM system_config WHERE "key" LIKE %s ORDER BY "key" ASC LIMIT %s',
                 (prefix + "%", limit),
             )
         else:
             rows = db.fetch_all(
-                "SELECT `key`,`value`,updated_at FROM system_config ORDER BY `key` ASC LIMIT %s",
+                'SELECT "key","value",updated_at FROM system_config ORDER BY "key" ASC LIMIT %s',
                 (limit,),
             )
         for r in rows or []:
@@ -606,16 +601,67 @@ def main() -> None:
             )
         )
 
+    if args.cmd == "diagnose":
+        from scripts.trading_test_tool.diagnose import run_diagnose
+        raise SystemExit(run_diagnose(settings, symbol=getattr(args, "symbol", None)))
+
+    if args.cmd == "check":
+        import compileall
+        import os
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        ok = compileall.compile_dir(root, quiet=1)
+        print("✅ 语法检查通过" if ok else "❌ 语法检查失败")
+        raise SystemExit(0 if ok else 1)
+
+    if args.cmd == "query":
+        db = PostgreSQL(settings.postgres_url)
+        try:
+            rows = db.fetch_all(getattr(args, "sql", ""))
+            print(json.dumps(rows, ensure_ascii=False, indent=2, default=_json_default))
+            return 0
+        except Exception as e:
+            print(f"❌ 查询失败: {e}", file=sys.stderr)
+            return 1
+        finally:
+            db.close()
+
     # 下面是原有简单命令
-    db = MariaDB(
-        host=settings.db_host,
-        port=settings.db_port,
-        user=settings.db_user,
-        password=settings.db_pass,
-        db=settings.db_name,
-    )
+    db = PostgreSQL(settings.postgres_url)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
     trace_id = new_trace_id("admin")
+
+    if args.cmd == "prepare":
+        # prepare命令等同于status，用于Docker环境
+        report: Dict[str, Any] = {
+            "env": getattr(settings, "env", getattr(settings, "app_env", "")),
+            "exchange": settings.exchange,
+            "symbol": settings.symbol,
+            "interval_minutes": settings.interval_minutes,
+            "db_ping": bool(db.ping()),
+        }
+        try:
+            r = redis_client(settings.redis_url)
+            report["redis_ping"] = bool(r.ping())
+        except Exception as e:
+            report["redis_ping"] = False
+            report["redis_error"] = str(e)
+
+        report["halt_trading"] = read_system_config(db, "HALT_TRADING", "false")
+        report["emergency_exit"] = read_system_config(db, "EMERGENCY_EXIT", "false")
+
+        ok, last = _wait_for_market_cache(
+            db,
+            symbol=settings.symbol,
+            interval_minutes=settings.interval_minutes,
+            feature_version=int(getattr(settings, 'feature_version', 1)),
+            wait_seconds=int(args.wait_seconds),
+            max_age_seconds=int(args.max_age_seconds),
+        )
+        report["market_cache_ok"] = ok
+        report["market_cache_last"] = last
+
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default))
+        return
 
     if args.cmd == "status":
         report: Dict[str, Any] = {

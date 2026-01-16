@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # E2E drill:
-# - start infra (mariadb/redis)
+# - start infra (postgres/redis)
 # - migrate schema
 # - (paper mode) seed synthetic klines+features
 # - run data-syncer once (optional)
@@ -28,7 +28,7 @@ source .env
 set +a
 
 echo "[drill] up infra..."
-docker compose up -d mariadb redis
+docker compose up -d postgres redis
 
 echo "[drill] migrate (via data-syncer container)..."
 docker compose run --rm -e RUN_ONCE=true data-syncer >/dev/null
@@ -44,11 +44,11 @@ fi
 echo "[drill] run strategy-engine once..."
 docker compose run --rm -e RUN_ONCE=true strategy-engine
 
-# Print results
+# Print results (使用trading_test_tool查询)
 echo "[drill] show last trade_logs..."
-docker compose exec -T mariadb bash -lc "mariadb -u${DB_USER:-alpha_user} -p${DB_PASS:-alpha_pass} -D ${DB_NAME:-alpha_sniper} -e \"SELECT id,created_at,symbol,status,qty,entry_price,exit_price,pnl,robot_score,ai_prob,open_reason_code,close_reason_code FROM trade_logs ORDER BY id DESC LIMIT 5;\"" || true
+docker compose exec execution python -m scripts.trading_test_tool query --sql "SELECT id,created_at,symbol,status,qty,entry_price,exit_price,pnl,robot_score,ai_prob,open_reason_code,close_reason_code FROM trade_logs ORDER BY id DESC LIMIT 5" || true
 
 echo "[drill] show last order_events..."
-docker compose exec -T mariadb bash -lc "mariadb -u${DB_USER:-alpha_user} -p${DB_PASS:-alpha_pass} -D ${DB_NAME:-alpha_sniper} -e \"SELECT id,created_at,symbol,client_order_id,event_type,side,qty,price,status,reason_code FROM order_events ORDER BY id DESC LIMIT 10;\"" || true
+docker compose exec execution python -m scripts.trading_test_tool query --sql "SELECT id,created_at,symbol,client_order_id,event_type,side,qty,price,status,reason_code FROM order_events ORDER BY id DESC LIMIT 10" || true
 
 echo "[drill] done."

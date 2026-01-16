@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from shared.config import Settings, load_settings
-from shared.db import MariaDB, migrate
+from shared.db import PostgreSQL, migrate
 from shared.exchange import make_exchange
 from shared.exchange.errors import RateLimitError
 from shared.logging import get_logger, new_trace_id
@@ -312,13 +312,13 @@ def compute_features_for_bars(
 # DB helpers
 # ----------------------------
 
-def upsert_heartbeat(db: MariaDB, instance_id: str, status: dict):
+def upsert_heartbeat(db: PostgreSQL, instance_id: str, status: dict):
     with db.tx() as cur:
         cur.execute(
             """
             INSERT INTO service_status (service_name, instance_id, last_heartbeat, status_json)
             VALUES (%s, %s, CURRENT_TIMESTAMP, %s)
-            ON DUPLICATE KEY UPDATE last_heartbeat=CURRENT_TIMESTAMP, status_json=VALUES(status_json)
+            ON CONFLICT (service_name, instance_id) DO UPDATE SET last_heartbeat=CURRENT_TIMESTAMP, status_json=EXCLUDED.status_json
             """,
             (SERVICE, instance_id, json.dumps(status, ensure_ascii=False)),
         )
@@ -331,7 +331,7 @@ def _hk_now() -> datetime:
 
 
 def _archive_table_timestamp(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     src: str,
     dst: str,
@@ -346,8 +346,20 @@ def _archive_table_timestamp(
     """
     cutoff = _utc_now() - timedelta(days=int(cutoff_days))
     with db.tx() as cur:
+        # PostgreSQL: INSERT IGNORE -> INSERT ... ON CONFLICT DO NOTHING
+        # 根据目标表确定冲突列
+        if dst == 'market_data_history':
+            conflict_cols = '(symbol, interval_minutes, open_time_ms)'
+        elif dst == 'market_data_cache_history':
+            conflict_cols = '(symbol, interval_minutes, open_time_ms, feature_version)'
+        elif dst in ('order_events_history', 'trade_logs_history', 'position_snapshots_history'):
+            conflict_cols = '(id)'
+        else:
+            # 默认使用id
+            conflict_cols = '(id)'
+        
         cur.execute(
-            f"INSERT IGNORE INTO {dst} ({columns}) SELECT {columns} FROM {src} WHERE created_at < %s",
+            f'INSERT INTO "{dst}" ({columns}) SELECT {columns} FROM "{src}" WHERE created_at < %s ON CONFLICT {conflict_cols} DO NOTHING',
             (cutoff,),
         )
         moved = cur.rowcount or 0
@@ -357,7 +369,7 @@ def _archive_table_timestamp(
         )
         return int(moved)
 
-def run_daily_archive(db: MariaDB, settings: Settings, metrics: Metrics, *, instance_id: str):
+def run_daily_archive(db: PostgreSQL, settings: Settings, metrics: Metrics, *, instance_id: str):
     """Run daily archive around HK midnight (00:00–00:05). Idempotent via system_config."""
     hk = _hk_now()
     if not (hk.hour == 0 and hk.minute <= 5):
@@ -365,7 +377,7 @@ def run_daily_archive(db: MariaDB, settings: Settings, metrics: Metrics, *, inst
 
     hk_date = hk.strftime("%Y-%m-%d")
     key = "ARCHIVE_LAST_HK_DATE"
-    last = db.fetch_one("SELECT value FROM system_config WHERE `key`=%s", (key,))
+    last = db.fetch_one('SELECT "value" FROM system_config WHERE "key"=%s', (key,))
     if last and last["value"] == hk_date:
         return
 
@@ -394,8 +406,8 @@ def run_daily_archive(db: MariaDB, settings: Settings, metrics: Metrics, *, inst
             )
             cur.execute(
                 """
-                INSERT INTO system_config (`key`, `value`) VALUES (%s, %s)
-                ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=CURRENT_TIMESTAMP
+                INSERT INTO system_config ("key", "value") VALUES (%s, %s)
+                ON CONFLICT ("key") DO UPDATE SET "value"=EXCLUDED."value", updated_at=CURRENT_TIMESTAMP
                 """,
                 (key, hk_date),
             )
@@ -411,7 +423,7 @@ def run_daily_archive(db: MariaDB, settings: Settings, metrics: Metrics, *, inst
 # ----------------------------
 
 def enqueue_precompute_tasks(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     symbol: str,
     interval_minutes: int,
@@ -426,15 +438,16 @@ def enqueue_precompute_tasks(
     with db.tx() as cur:
         cur.executemany(
             """
-            INSERT IGNORE INTO precompute_tasks
+            INSERT INTO precompute_tasks
               (symbol, interval_minutes, open_time_ms, feature_version, status, try_count, last_error, trace_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, interval_minutes, open_time_ms, feature_version) DO NOTHING
             """,
             rows,
         )
         return cur.rowcount or 0
 
-def _mark_tasks_done(db: MariaDB, *, symbol: str, interval_minutes: int, feature_version: int, up_to_open_time_ms: int):
+def _mark_tasks_done(db: PostgreSQL, *, symbol: str, interval_minutes: int, feature_version: int, up_to_open_time_ms: int):
     with db.tx() as cur:
         cur.execute(
             """
@@ -445,7 +458,7 @@ def _mark_tasks_done(db: MariaDB, *, symbol: str, interval_minutes: int, feature
             (symbol, interval_minutes, int(feature_version or 1), int(up_to_open_time_ms)),
         )
 
-def _mark_tasks_error(db: MariaDB, *, symbol: str, interval_minutes: int, feature_version: int, open_times: List[int], trace_id: str, err: str):
+def _mark_tasks_error(db: PostgreSQL, *, symbol: str, interval_minutes: int, feature_version: int, open_times: List[int], trace_id: str, err: str):
     if not open_times:
         return
     with db.tx() as cur:
@@ -461,7 +474,7 @@ def _mark_tasks_error(db: MariaDB, *, symbol: str, interval_minutes: int, featur
 
 
 def process_precompute_tasks(
-    db: MariaDB,
+    db: PostgreSQL,
     settings: Settings,
     metrics: Metrics,
     *,
@@ -618,11 +631,11 @@ def process_precompute_tasks(
                 INSERT INTO market_data_cache
                   (symbol, interval_minutes, open_time_ms, feature_version, ema_fast, ema_slow, rsi, features_json)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                  ema_fast=VALUES(ema_fast),
-                  ema_slow=VALUES(ema_slow),
-                  rsi=VALUES(rsi),
-                  features_json=VALUES(features_json)
+                ON CONFLICT (symbol, interval_minutes, open_time_ms, feature_version) DO UPDATE SET
+                  ema_fast=EXCLUDED.ema_fast,
+                  ema_slow=EXCLUDED.ema_slow,
+                  rsi=EXCLUDED.rsi,
+                  features_json=EXCLUDED.features_json
                 """,
                 cache_rows,
             )
@@ -642,7 +655,7 @@ def process_precompute_tasks(
 # Sync + gap fill
 # ----------------------------
 
-def _insert_market_data(db: MariaDB, *, symbol: str, interval: int, klines) -> int:
+def _insert_market_data(db: PostgreSQL, *, symbol: str, interval: int, klines) -> int:
     rows = [
         (symbol, interval, int(k.open_time_ms), int(k.close_time_ms), k.open, k.high, k.low, k.close, k.volume)
         for k in klines
@@ -652,15 +665,16 @@ def _insert_market_data(db: MariaDB, *, symbol: str, interval: int, klines) -> i
     with db.tx() as cur:
         cur.executemany(
             """
-            INSERT IGNORE INTO market_data
+            INSERT INTO market_data
               (symbol, interval_minutes, open_time_ms, close_time_ms, open_price, high_price, low_price, close_price, volume)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, interval_minutes, open_time_ms) DO NOTHING
             """,
             rows,
         )
         return cur.rowcount or 0
 
-def _fill_recent_gaps(db: MariaDB, ex, settings: Settings, metrics: Metrics, *, symbol: str, trace_id: str) -> int:
+def _fill_recent_gaps(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, *, symbol: str, trace_id: str) -> int:
     """Detect gaps in last N bars and attempt to backfill missing klines."""
     interval = int(settings.interval_minutes)
     interval_ms = interval * 60_000
@@ -671,7 +685,7 @@ def _fill_recent_gaps(db: MariaDB, ex, settings: Settings, metrics: Metrics, *, 
         ORDER BY open_time_ms DESC LIMIT 600
         """,
         # NOTE: market_data is not versioned by feature_version.
-        # Passing extra params will crash PyMySQL with:
+        # Passing extra params will crash psycopg2 with:
         #   "not all arguments converted during string formatting"
         (symbol, interval),
     )
@@ -708,7 +722,7 @@ def _fill_recent_gaps(db: MariaDB, ex, settings: Settings, metrics: Metrics, *, 
     return missing_total
 
 
-def sync_symbol_once(db: MariaDB, ex, settings: Settings, metrics: Metrics, telegram: Telegram, *, symbol: str, instance_id: str):
+def sync_symbol_once(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, telegram: Telegram, *, symbol: str, instance_id: str):
     interval = int(settings.interval_minutes)
     interval_ms = interval * 60_000
     trace_id = new_trace_id("sync")
@@ -820,7 +834,7 @@ def sync_symbol_once(db: MariaDB, ex, settings: Settings, metrics: Metrics, tele
 
 def main():
     settings = load_settings()
-    db = MariaDB(settings.db_host, settings.db_port, settings.db_user, settings.db_pass, settings.db_name)
+    db = PostgreSQL(settings.postgres_url)
     migrate(db, Path(__file__).resolve().parents[2] / "migrations")
 
     metrics = Metrics(SERVICE)
@@ -926,8 +940,19 @@ def main():
             processed = process_precompute_tasks(db, settings, metrics, symbol=sym, max_tasks=800)
             if processed:
                 logger.info(f"precompute_done symbol={sym} processed={processed}")
+            
+            # 添加交易对间延迟，避免突发请求导致速率限制
+            # 每个交易对间隔可配置，默认0.5秒，20个交易对约10秒，加上处理时间，总循环约20-30秒
+            if sym != symbols[-1]:  # 最后一个交易对不需要延迟
+                delay = float(getattr(settings, "data_sync_symbol_delay_seconds", 0.5))
+                if delay > 0:
+                    time.sleep(delay)
 
-        time.sleep(10)
+        # 可配置的基础同步间隔，默认30秒（相比原来10秒减少67%请求频率）
+        # 20个交易对 × 0.5秒延迟 + 30秒基础间隔 = 每分钟约40次请求（原来120次）
+        # 如果仍有速率限制问题，可以通过环境变量 DATA_SYNC_LOOP_INTERVAL_SECONDS=60 进一步增加
+        loop_interval = float(getattr(settings, "data_sync_loop_interval_seconds", 30.0))
+        time.sleep(loop_interval)
 
 
 if __name__ == "__main__":

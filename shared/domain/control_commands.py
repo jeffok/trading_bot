@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from shared.db import MariaDB
+from shared.db import PostgreSQL
 
 
 def write_control_command(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     command: str,
     payload: Dict[str, Any],
@@ -18,29 +18,30 @@ def write_control_command(
     reason: Optional[str] = None,
 ) -> int:
     """Append a control command (auditable). Returns inserted id (best-effort)."""
-    db.execute(
-        """
-        INSERT INTO control_commands(command, payload_json, status, trace_id, actor, reason_code, reason)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            str(command),
-            json.dumps(payload, ensure_ascii=False),
-            str(status),
-            (str(trace_id) if trace_id else None),
-            (str(actor) if actor else None),
-            (str(reason_code) if reason_code else None),
-            (str(reason) if reason else None),
-        ),
-    )
     try:
-        row = db.fetch_one("SELECT LAST_INSERT_ID() AS id")
+        # PostgreSQL: 使用RETURNING获取插入的ID
+        row = db.fetch_one(
+            """
+            INSERT INTO control_commands(command, payload_json, status, trace_id, actor, reason_code, reason)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                str(command),
+                json.dumps(payload, ensure_ascii=False),
+                str(status),
+                (str(trace_id) if trace_id else None),
+                (str(actor) if actor else None),
+                (str(reason_code) if reason_code else None),
+                (str(reason) if reason else None),
+            ),
+        )
         return int(row["id"]) if row and row.get("id") is not None else 0
     except Exception:
         return 0
 
 
-def fetch_new_control_commands(db: MariaDB, *, limit: int = 50) -> List[Dict[str, Any]]:
+def fetch_new_control_commands(db: PostgreSQL, *, limit: int = 50) -> List[Dict[str, Any]]:
     rows = db.fetch_all(
         """
         SELECT id, created_at, command, payload_json, trace_id, actor, reason_code, reason
@@ -74,7 +75,7 @@ def fetch_new_control_commands(db: MariaDB, *, limit: int = 50) -> List[Dict[str
 
 
 def mark_control_command_processed(
-    db: MariaDB,
+    db: PostgreSQL,
     *,
     command_id: int,
     status: str = "PROCESSED",
