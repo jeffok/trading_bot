@@ -219,7 +219,9 @@ class Settings:
 
     # Data lag alerts (V8.3): send Telegram alert when cache lag exceeds threshold
     market_data_lag_alert_seconds: float = float(os.getenv("MARKET_DATA_LAG_ALERT_SECONDS", "120"))
-    market_data_lag_alert_cooldown_seconds: float = float(os.getenv("MARKET_DATA_LAG_ALERT_COOLDOWN_SECONDS", "300"))
+    # 冷却时间（秒）：同一交易对的告警间隔，避免重复告警
+    # 默认 1800 秒（30分钟），如果数据延迟持续存在，每30分钟发送一次告警
+    market_data_lag_alert_cooldown_seconds: float = float(os.getenv("MARKET_DATA_LAG_ALERT_COOLDOWN_SECONDS", "1800"))
 
 
     # Observability / runtime identity

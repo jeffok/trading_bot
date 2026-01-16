@@ -722,7 +722,7 @@ def _fill_recent_gaps(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, 
     return missing_total
 
 
-def sync_symbol_once(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, telegram: Telegram, *, symbol: str, instance_id: str):
+def sync_symbol_once(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, telegram: Telegram, *, symbol: str, instance_id: str, redis_client_instance=None):
     interval = int(settings.interval_minutes)
     interval_ms = interval * 60_000
     trace_id = new_trace_id("sync")
@@ -775,12 +775,36 @@ def sync_symbol_once(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, t
             metrics.data_sync_lag_ms.labels(SERVICE, symbol, str(interval)).set(lag)
 
             # Telegram alert when lag exceeds threshold (throttled)
+            # 使用 Redis 实现跨实例冷却，避免多实例重复告警
             try:
                 threshold_ms = int(float(getattr(settings, 'market_data_lag_alert_seconds', 120)) * 1000.0)
-                cooldown_s = float(getattr(settings, 'market_data_lag_alert_cooldown_seconds', 300))
+                cooldown_s = float(getattr(settings, 'market_data_lag_alert_cooldown_seconds', 1800))  # 默认30分钟
                 now_ts = time.time()
-                last_ts = float(LAG_ALERT_LAST_AT.get(symbol, 0.0) or 0.0)
+                
+                # 优先使用 Redis 存储告警时间（跨实例共享）
+                redis_key = f"lag_alert_last_at:{symbol}:{interval}:{int(settings.feature_version)}"
+                last_ts = 0.0
+                
+                # 尝试从 Redis 获取上次告警时间
+                if redis_client_instance is not None:
+                    try:
+                        last_ts_str = redis_client_instance.get(redis_key)
+                        if last_ts_str:
+                            last_ts = float(last_ts_str)
+                    except Exception:
+                        pass  # Redis 不可用时回退到内存字典
+                
+                # 如果 Redis 中没有，回退到内存字典（向后兼容）
+                if last_ts == 0.0:
+                    last_ts = float(LAG_ALERT_LAST_AT.get(symbol, 0.0) or 0.0)
+                
                 if threshold_ms > 0 and lag > threshold_ms and settings.is_telegram_enabled() and (now_ts - last_ts) >= cooldown_s:
+                    # 更新 Redis 和内存字典
+                    if redis_client_instance is not None:
+                        try:
+                            redis_client_instance.setex(redis_key, int(cooldown_s * 2), str(now_ts))  # TTL 为冷却时间的2倍
+                        except Exception:
+                            pass  # Redis 不可用时仅更新内存字典
                     LAG_ALERT_LAST_AT[symbol] = now_ts
                     summary = build_system_summary(
                         event='DATA_LAG',
@@ -927,7 +951,7 @@ def main():
 
         for sym in symbols:
             try:
-                sync_symbol_once(db, ex, settings, metrics, telegram, symbol=sym, instance_id=instance_id)
+                sync_symbol_once(db, ex, settings, metrics, telegram, symbol=sym, instance_id=instance_id, redis_client_instance=r)
             except RateLimitError as e:
                 sleep_s = e.retry_after_seconds or 2.0
                 try:
