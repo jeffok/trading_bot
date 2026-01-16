@@ -13,10 +13,12 @@ try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
     from psycopg2.pool import ThreadedConnectionPool
+    from psycopg2 import extensions
 except ImportError:
     psycopg2 = None
     RealDictCursor = None
     ThreadedConnectionPool = None
+    extensions = None
 
 
 class PostgreSQL:
@@ -40,6 +42,43 @@ class PostgreSQL:
         if self._pool is None:
             # 解析URL
             parsed = urlparse(self.postgres_url)
+            database = parsed.path.lstrip('/')
+            
+            # 如果数据库不存在，尝试创建（连接到postgres数据库）
+            if database:
+                try:
+                    # 先尝试连接目标数据库
+                    test_conn = psycopg2.connect(
+                        host=parsed.hostname,
+                        port=parsed.port or 5432,
+                        user=parsed.username,
+                        password=parsed.password,
+                        database=database,
+                        connect_timeout=2,
+                    )
+                    test_conn.close()
+                except psycopg2.OperationalError as e:
+                    if "does not exist" in str(e):
+                        # 数据库不存在，尝试创建
+                        try:
+                            admin_conn = psycopg2.connect(
+                                host=parsed.hostname,
+                                port=parsed.port or 5432,
+                                user=parsed.username,
+                                password=parsed.password,
+                                database="postgres",  # 连接到默认数据库
+                                connect_timeout=2,
+                            )
+                            admin_conn.set_isolation_level(extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+                            cur = admin_conn.cursor()
+                            # 使用双引号转义数据库名
+                            cur.execute(f'CREATE DATABASE "{database}"')
+                            cur.close()
+                            admin_conn.close()
+                        except Exception as create_err:
+                            # 创建失败，抛出原始错误
+                            raise e
+            
             self._pool = ThreadedConnectionPool(
                 minconn=1,
                 maxconn=10,
@@ -47,7 +86,7 @@ class PostgreSQL:
                 port=parsed.port or 5432,
                 user=parsed.username,
                 password=parsed.password,
-                database=parsed.path.lstrip('/'),
+                database=database,
             )
         return self._pool.getconn()
     
