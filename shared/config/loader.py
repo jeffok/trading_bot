@@ -241,6 +241,11 @@ class Settings:
     bybit_api_key: str = os.getenv("BYBIT_API_KEY", "")
     bybit_api_secret: str = os.getenv("BYBIT_API_SECRET", "")
     bybit_recv_window: int = int(os.getenv("BYBIT_RECV_WINDOW", "5000"))
+    # Bybit WebSocket URLs
+    bybit_public_ws_url: str = os.getenv("BYBIT_PUBLIC_WS_URL", "wss://stream.bybit.com/v5/public/linear")
+    bybit_private_ws_url: str = os.getenv("BYBIT_PRIVATE_WS_URL", "wss://stream.bybit.com/v5/private")
+    # WebSocket 启用开关
+    bybit_ws_enabled: bool = os.getenv("BYBIT_WS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
 
     # paper（如果你不用 paper，这些不会影响）
     paper_starting_usdt: float = float(os.getenv("PAPER_STARTING_USDT", "1000"))

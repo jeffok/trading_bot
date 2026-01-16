@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -14,6 +16,14 @@ from .base import ExchangeClient
 from .errors import AuthError, ExchangeError, RateLimitError, TemporaryError
 from .rate_limiter import AdaptiveRateLimiter
 from .types import Kline, OrderResult
+
+try:
+    from .bybit_ws import BybitWebSocketClient, WSMessage
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+    BybitWebSocketClient = None
+    WSMessage = None
 
 
 def _now_ms() -> int:
@@ -49,6 +59,9 @@ class BybitV5LinearClient(ExchangeClient):
         limiter: AdaptiveRateLimiter,
         metrics=None,
         service_name: str = "unknown",
+        public_ws_url: Optional[str] = None,
+        private_ws_url: Optional[str] = None,
+        ws_enabled: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         
@@ -134,6 +147,33 @@ class BybitV5LinearClient(ExchangeClient):
             "position_list": 1.0,       # 1秒缓存
             "order_status": 0.5,        # 0.5秒缓存
         }
+
+        # WebSocket 支持
+        self.ws_enabled = ws_enabled and WS_AVAILABLE
+        self.ws_client: Optional[BybitWebSocketClient] = None
+        self.ws_loop: Optional[asyncio.AbstractEventLoop] = None
+        self.ws_thread: Optional[threading.Thread] = None
+        self._ws_kline_callbacks: Dict[str, List[Any]] = {}
+        self._ws_order_callbacks: Dict[str, List[Any]] = {}
+        self._ws_kline_buffer: Dict[str, List[Kline]] = {}  # 缓存WebSocket接收的K线数据
+        
+        if self.ws_enabled:
+            try:
+                self.ws_client = BybitWebSocketClient(
+                    public_ws_url=public_ws_url or "wss://stream.bybit.com/v5/public/linear",
+                    private_ws_url=private_ws_url or "wss://stream.bybit.com/v5/private",
+                    api_key=self.api_key,
+                    api_secret=api_secret_cleaned,
+                    recv_window=self.recv_window,
+                    service_name=service_name,
+                )
+                _logger.info(f"[{service_name}] WebSocket client initialized (enabled={self.ws_enabled})")
+            except Exception as e:
+                _logger.warning(f"[{service_name}] Failed to initialize WebSocket client: {e}")
+                self.ws_enabled = False
+                self.ws_client = None
+        else:
+            _logger.info(f"[{service_name}] WebSocket disabled (ws_enabled={ws_enabled}, WS_AVAILABLE={WS_AVAILABLE})")
 
     # -------------------------
     # Bybit V5 签名
@@ -523,6 +563,120 @@ class BybitV5LinearClient(ExchangeClient):
             pass
 
         self._prepared_symbols.add(symbol)
+
+    # -------------------------
+    # WebSocket 管理
+    # -------------------------
+    def start_websocket(self):
+        """启动 WebSocket 客户端（在后台线程中运行）"""
+        if not self.ws_enabled or not self.ws_client:
+            return
+        
+        def _run_ws():
+            try:
+                self.ws_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.ws_loop)
+                self.ws_loop.run_until_complete(self.ws_client.start())
+            except Exception as e:
+                _logger.error(f"[{self.service_name}] WebSocket loop error: {e}", exc_info=True)
+        
+        self.ws_thread = threading.Thread(target=_run_ws, daemon=True, name="bybit-ws")
+        self.ws_thread.start()
+        _logger.info(f"[{self.service_name}] WebSocket thread started")
+
+    def stop_websocket(self):
+        """停止 WebSocket 客户端"""
+        if not self.ws_client or not self.ws_loop:
+            return
+        
+        try:
+            if self.ws_loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.ws_client.stop(), self.ws_loop)
+        except Exception as e:
+            _logger.warning(f"[{self.service_name}] Error stopping WebSocket: {e}")
+        
+        if self.ws_thread and self.ws_thread.is_alive():
+            self.ws_thread.join(timeout=5.0)
+        
+        _logger.info(f"[{self.service_name}] WebSocket stopped")
+
+    def subscribe_kline(self, symbol: str, interval_minutes: int, callback: Optional[Callable[[Kline], None]] = None):
+        """订阅 K线数据（WebSocket）"""
+        if not self.ws_enabled or not self.ws_client:
+            return False
+        
+        topic = f"kline.{interval_minutes}.{symbol}"
+        
+        # 注册回调
+        if callback:
+            if symbol not in self._ws_kline_callbacks:
+                self._ws_kline_callbacks[symbol] = []
+            self._ws_kline_callbacks[symbol].append(callback)
+        
+        # 设置消息处理
+        def _handle_kline(msg: WSMessage):
+            kline = self.ws_client.parse_kline(msg)
+            if kline:
+                # 缓存 K线数据
+                if symbol not in self._ws_kline_buffer:
+                    self._ws_kline_buffer[symbol] = []
+                self._ws_kline_buffer[symbol].append(kline)
+                # 保持最近100条
+                if len(self._ws_kline_buffer[symbol]) > 100:
+                    self._ws_kline_buffer[symbol] = self._ws_kline_buffer[symbol][-100:]
+                
+                # 调用回调
+                if symbol in self._ws_kline_callbacks:
+                    for cb in self._ws_kline_callbacks[symbol]:
+                        try:
+                            cb(kline)
+                        except Exception as e:
+                            _logger.warning(f"[{self.service_name}] Kline callback error: {e}")
+        
+        self.ws_client.on_message(topic, _handle_kline)
+        
+        # 订阅（异步）
+        if self.ws_loop and self.ws_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.ws_client.subscribe_public(topic),
+                self.ws_loop
+            )
+            return True
+        return False
+
+    def subscribe_order_updates(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+        """订阅订单状态更新（WebSocket 私有频道）"""
+        if not self.ws_enabled or not self.ws_client:
+            return False
+        
+        topic = "order"
+        
+        # 注册回调
+        if callback:
+            if "order" not in self._ws_order_callbacks:
+                self._ws_order_callbacks["order"] = []
+            self._ws_order_callbacks["order"].append(callback)
+        
+        # 设置消息处理
+        def _handle_order(msg: WSMessage):
+            # 调用回调
+            if "order" in self._ws_order_callbacks:
+                for cb in self._ws_order_callbacks["order"]:
+                    try:
+                        cb(msg.data)
+                    except Exception as e:
+                        _logger.warning(f"[{self.service_name}] Order callback error: {e}")
+        
+        self.ws_client.on_message(topic, _handle_order)
+        
+        # 订阅（异步）
+        if self.ws_loop and self.ws_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.ws_client.subscribe_private(topic),
+                self.ws_loop
+            )
+            return True
+        return False
 
     # -------------------------
     # 行情

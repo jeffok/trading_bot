@@ -37,6 +37,9 @@ def make_exchange(settings, *, metrics=None, service_name: str = "unknown"):
             limiter=limiter,
             metrics=metrics,
             service_name=service_name,
+            public_ws_url=settings.bybit_public_ws_url,
+            private_ws_url=settings.bybit_private_ws_url,
+            ws_enabled=settings.bybit_ws_enabled,
         )
 
     return PaperExchange(starting_usdt=settings.paper_starting_usdt, fee_pct=settings.paper_fee_pct)

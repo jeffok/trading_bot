@@ -7,3 +7,4 @@ python-dotenv==1.0.1
 psycopg2-binary==2.9.9
 redis==5.2.1
 prometheus_client==0.21.1
+websockets==14.1
