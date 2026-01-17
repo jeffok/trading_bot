@@ -28,8 +28,8 @@ docker compose up --build
 
 3) 检查健康：
 
-- API：`http://localhost:8080/health`
-- Metrics：`http://localhost:8080/metrics`
+- API：`http://localhost:9001/health`
+- Metrics：`http://localhost:9001/metrics`
 
 ---
 
@@ -65,7 +65,7 @@ docker compose up --build
 
 ## 5. 常用管理接口
 
-API 服务：`http://localhost:8080`
+API 服务：`http://localhost:9001`
 
 - `POST /admin/halt`  （暂停策略下单）
 - `POST /admin/resume`（恢复策略下单）
@@ -80,17 +80,17 @@ API 服务：`http://localhost:8080`
 
 ```bash
 # 准备检查（检查配置、服务状态等）
-docker compose exec execution python -m scripts.trading_test_tool prepare
+docker compose exec api-service tbot prepare
 
 # 查看系统状态
-docker compose exec execution python -m scripts.trading_test_tool status
+docker compose exec api-service tbot status
 
 # 诊断为什么没有下单
-docker compose exec execution python -m scripts.trading_test_tool diagnose
+docker compose exec api-service tbot diagnose
 
 # 暂停/恢复交易
-docker compose exec execution python -m scripts.trading_test_tool halt --by admin --reason-code ADMIN_HALT --reason "maintenance"
-docker compose exec execution python -m scripts.trading_test_tool resume --by admin --reason-code ADMIN_RESUME --reason "ok"
+docker compose exec api-service tbot halt --by admin --reason-code ADMIN_HALT --reason "maintenance"
+docker compose exec api-service tbot resume --by admin --reason-code ADMIN_RESUME --reason "ok"
 ```
 
 > ⚠️ 重要：此工具只能在Docker容器中使用。CLI 会直接读写 PostgreSQL（等价于调用 /admin 的写入路径），同样会写审计与可选 Telegram。

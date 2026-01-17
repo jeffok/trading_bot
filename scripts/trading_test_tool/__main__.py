@@ -147,9 +147,8 @@ def require_admin_token(settings: Settings, token: str | None) -> None:
     if not token:
         raise SystemExit("ERROR: Admin token required. Use --token <token> or set ADMIN_TOKEN environment variable")
     
-    # 检查token是否在允许的token列表中
-    allowed_tokens = set(settings.admin_tokens or [])
-    if token not in allowed_tokens:
+    # 检查token是否匹配
+    if token != settings.admin_token:
         raise SystemExit("ERROR: Invalid admin token")
 
 
@@ -582,6 +581,8 @@ def main() -> None:
     p_arm_stop.add_argument("--reason", required=True, help="原因说明")
     p_arm_stop.add_argument("--stop-poll-seconds", type=int, default=10, dest="stop_poll_seconds", help="止损单轮询间隔（默认：10秒）")
 
+    p_config = sub.add_parser("config", help="输出所有配置参数（以JSON格式）")
+
     args = parser.parse_args()
 
     if args.cmd == "set":
@@ -904,6 +905,22 @@ def main() -> None:
             log_action(logger, action="EMERGENCY_EXIT", trace_id=trace_id, reason_code=args.reason_code,
                        reason=args.reason, client_order_id=None)
         print(f"OK trace_id={trace_id}")
+        return
+
+    if args.cmd == "config":
+        # 输出所有 Settings 配置参数
+        import dataclasses
+        config_dict = {}
+        for field in dataclasses.fields(settings):
+            value = getattr(settings, field.name, None)
+            # 过滤敏感信息
+            if field.name in ("admin_token", "binance_api_secret", "bybit_api_secret", "postgres_url", "redis_url"):
+                config_dict[field.name] = "***REDACTED***"
+            elif isinstance(value, tuple):
+                config_dict[field.name] = list(value)
+            else:
+                config_dict[field.name] = value
+        print(json.dumps(config_dict, ensure_ascii=False, indent=2, default=_json_default))
         return
 
     if args.cmd == "arm-stop":

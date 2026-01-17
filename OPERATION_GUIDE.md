@@ -23,16 +23,16 @@
 
 ```bash
 # 基本格式
-docker compose exec execution tbot <command> [args...]
+docker compose exec api-service tbot <command> [args...]
 
 # 示例：查看帮助
-docker compose exec execution tbot --help
+docker compose exec api-service tbot --help
 
 # 示例：查看系统状态
-docker compose exec execution tbot status
+docker compose exec api-service tbot status
 
 # 示例：诊断问题
-docker compose exec execution tbot diagnose
+docker compose exec api-service tbot diagnose
 ```
 
 #### 方式 2：使用脚本文件（本地开发）
@@ -54,19 +54,19 @@ python -m scripts.trading_test_tool --help
 python -m scripts.trading_test_tool status
 ```
 
-> ⚠️ **重要提示**: 本文档中的示例都使用方式 1（Docker 方式）。如果使用其他方式，请将 `docker compose exec execution tbot` 替换为 `./scripts/tbot` 或 `python -m scripts.trading_test_tool`。
+> ⚠️ **重要提示**: 本文档中的示例都使用方式 1（Docker 方式）。如果使用其他方式，请将 `docker compose exec api-service tbot` 替换为 `./scripts/tbot` 或 `python -m scripts.trading_test_tool`。
 
 ### 1.4 查看帮助
 
 ```bash
 # 查看所有可用命令
-docker compose exec execution tbot --help
+docker compose exec api-service tbot --help
 
 # 查看具体命令的帮助信息
-docker compose exec execution tbot diagnose --help
-docker compose exec execution tbot backtest --help
-docker compose exec execution tbot restart --help
-docker compose exec execution tbot seed --help
+docker compose exec api-service tbot diagnose --help
+docker compose exec api-service tbot backtest --help
+docker compose exec api-service tbot restart --help
+docker compose exec api-service tbot seed --help
 ```
 
 ### 1.5 常用命令列表
@@ -75,34 +75,34 @@ docker compose exec execution tbot seed --help
 
 ```bash
 # 查看完整系统状态（数据库、Redis、市场数据缓存、系统开关等）
-docker compose exec execution tbot status
+docker compose exec api-service tbot status
 
 # 查看指定配置项
-docker compose exec execution tbot get HALT_TRADING
-docker compose exec execution tbot get EMERGENCY_EXIT
+docker compose exec api-service tbot get HALT_TRADING
+docker compose exec api-service tbot get EMERGENCY_EXIT
 
 # 列出所有配置（支持前缀过滤）
-docker compose exec execution tbot list
-docker compose exec execution tbot list --prefix SETUP_B
+docker compose exec api-service tbot list
+docker compose exec api-service tbot list --prefix SETUP_B
 ```
 
 #### 交易控制
 
 ```bash
 # 暂停交易
-docker compose exec execution tbot halt \
+docker compose exec api-service tbot halt \
   --by admin \
   --reason-code ADMIN_HALT \
   --reason "系统维护"
 
 # 恢复交易
-docker compose exec execution tbot resume \
+docker compose exec api-service tbot resume \
   --by admin \
   --reason-code ADMIN_RESUME \
   --reason "维护完成"
 
 # 紧急退出（清仓所有持仓）
-docker compose exec execution tbot emergency-exit \
+docker compose exec api-service tbot emergency-exit \
   --by admin \
   --reason-code EMERGENCY_EXIT \
   --reason "紧急情况" \
@@ -113,33 +113,33 @@ docker compose exec execution tbot emergency-exit \
 
 ```bash
 # 设置配置项
-docker compose exec execution tbot set \
+docker compose exec api-service tbot set \
   SETUP_B_ADX_MIN 18 \
   --by admin \
   --reason-code ADMIN_UPDATE_CONFIG \
   --reason "降低ADX阈值增加交易机会"
 
 # 获取配置项
-docker compose exec execution tbot get SETUP_B_ADX_MIN
+docker compose exec api-service tbot get SETUP_B_ADX_MIN
 ```
 
 #### 诊断和测试
 
 ```bash
 # 诊断为什么没有下单（推荐）
-docker compose exec execution tbot diagnose
+docker compose exec api-service tbot diagnose
 
 # 诊断指定交易对
-docker compose exec execution tbot diagnose --symbol BTCUSDT
+docker compose exec api-service tbot diagnose --symbol BTCUSDT
 
 # 链路自检（检查数据库、Redis、市场数据缓存）
-docker compose exec execution tbot smoke-test
+docker compose exec api-service tbot smoke-test
 
 # 端到端测试（实盘交易测试，需谨慎使用）
-docker compose exec execution tbot e2e-test --yes
+docker compose exec api-service tbot e2e-test --yes
 
 # 历史回测（需要管理员Token）
-docker compose exec execution tbot backtest \
+docker compose exec api-service tbot backtest \
   --token YOUR_ADMIN_TOKEN \
   --symbol BTCUSDT \
   --months 6
@@ -149,15 +149,15 @@ docker compose exec execution tbot backtest \
 
 ```bash
 # 重启单个服务
-docker compose exec execution tbot restart data-syncer
-docker compose exec execution tbot restart strategy-engine
-docker compose exec execution tbot restart api-service
+docker compose exec api-service tbot restart data-syncer
+docker compose exec api-service tbot restart strategy-engine
+docker compose exec api-service tbot restart api-service
 
 # 重启所有服务
-docker compose exec execution tbot restart all
+docker compose exec api-service tbot restart all
 
 # 启用保护止损订单
-docker compose exec execution tbot arm-stop \
+docker compose exec api-service tbot arm-stop \
   --by admin \
   --reason-code ADMIN_UPDATE_CONFIG \
   --reason "启用保护止损" \
@@ -168,10 +168,10 @@ docker compose exec execution tbot arm-stop \
 
 ```bash
 # 生成合成测试数据（用于测试）
-docker compose exec execution tbot seed --bars 260 --start-price 40000
+docker compose exec api-service tbot seed --bars 260 --start-price 40000
 
 # SQL查询（调试用）
-docker compose exec execution tbot query --sql "SELECT * FROM system_config LIMIT 10"
+docker compose exec api-service tbot query --sql "SELECT * FROM system_config LIMIT 10"
 ```
 
 ### 1.6 命令详解
@@ -182,10 +182,10 @@ docker compose exec execution tbot query --sql "SELECT * FROM system_config LIMI
 
 ```bash
 # 诊断所有交易对
-docker compose exec execution tbot diagnose
+docker compose exec api-service tbot diagnose
 
 # 诊断指定交易对
-docker compose exec execution tbot diagnose --symbol BTCUSDT
+docker compose exec api-service tbot diagnose --symbol BTCUSDT
 ```
 
 **功能**:
@@ -201,7 +201,7 @@ docker compose exec execution tbot diagnose --symbol BTCUSDT
 查看系统的完整状态信息：
 
 ```bash
-docker compose exec execution tbot status
+docker compose exec api-service tbot status
 ```
 
 **显示内容**:
@@ -216,7 +216,7 @@ docker compose exec execution tbot status
 分析过去指定月数内 Setup B 信号出现次数：
 
 ```bash
-docker compose exec execution tbot backtest \
+docker compose exec api-service tbot backtest \
   --token YOUR_ADMIN_TOKEN \
   --symbol BTCUSDT \
   --months 6 \
@@ -242,12 +242,12 @@ docker compose exec execution tbot backtest \
 
 ```bash
 # 重启单个服务
-docker compose exec execution tbot restart data-syncer
-docker compose exec execution tbot restart strategy-engine
-docker compose exec execution tbot restart api-service
+docker compose exec api-service tbot restart data-syncer
+docker compose exec api-service tbot restart strategy-engine
+docker compose exec api-service tbot restart api-service
 
 # 重启所有服务
-docker compose exec execution tbot restart all
+docker compose exec api-service tbot restart all
 ```
 
 ### 1.7 使用建议
@@ -276,21 +276,21 @@ docker compose exec execution tbot restart all
 
 ```bash
 # 检查健康状态（包括HALT状态）
-curl http://localhost:8080/health | jq
+curl http://localhost:9001/health | jq
 
 # 检查详细状态（需要admin token）
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-     http://localhost:8080/admin/status | jq
+     http://localhost:9001/admin/status | jq
 ```
 
 #### 方法2: 使用 tbot 工具诊断
 
 ```bash
 # 诊断所有交易对
-docker compose exec execution tbot diagnose
+docker compose exec api-service tbot diagnose
 
 # 诊断指定交易对
-docker compose exec execution tbot diagnose --symbol BTCUSDT
+docker compose exec api-service tbot diagnose --symbol BTCUSDT
 ```
 
 #### 方法3: 检查Docker日志
@@ -312,7 +312,7 @@ docker-compose logs strategy-engine --since 1h | grep -E "SETUP_B|reason"
 **解决方法**:
 ```bash
 # 通过API恢复
-curl -X POST http://localhost:8080/admin/resume \
+curl -X POST http://localhost:9001/admin/resume \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -322,7 +322,7 @@ curl -X POST http://localhost:8080/admin/resume \
   }'
 
 # 或通过CLI（仅在Docker中使用）
-docker compose exec execution tbot resume \
+docker compose exec api-service tbot resume \
   --by admin \
   --reason-code ADMIN_RESUME \
   --reason "恢复交易"
@@ -358,7 +358,7 @@ docker compose exec execution tbot resume \
 **检查方法**:
 ```bash
 # 使用 tbot 工具检查
-docker compose exec execution tbot query --sql "SELECT symbol, TIMESTAMPDIFF(SECOND, updated_at, NOW()) AS lag_seconds FROM market_data_cache ORDER BY updated_at DESC LIMIT 10"
+docker compose exec api-service tbot query --sql "SELECT symbol, TIMESTAMPDIFF(SECOND, updated_at, NOW()) AS lag_seconds FROM market_data_cache ORDER BY updated_at DESC LIMIT 10"
 ```
 
 **解决方法**: 检查data-syncer服务状态，确保正常运行
@@ -497,7 +497,7 @@ docker compose restart strategy-engine
 docker compose logs data-syncer | grep -i "rate_limit\|10006"
 
 # 检查当前配置
-docker compose exec execution tbot get DATA_SYNC_LOOP_INTERVAL_SECONDS
+docker compose exec api-service tbot get DATA_SYNC_LOOP_INTERVAL_SECONDS
 ```
 
 **解决**:
@@ -515,7 +515,7 @@ docker compose exec execution tbot get DATA_SYNC_LOOP_INTERVAL_SECONDS
 docker compose logs data-syncer --tail 100
 
 # 检查市场数据缓存
-docker compose exec execution tbot query --sql "SELECT symbol, MAX(updated_at) as last_update FROM market_data_cache GROUP BY symbol"
+docker compose exec api-service tbot query --sql "SELECT symbol, MAX(updated_at) as last_update FROM market_data_cache GROUP BY symbol"
 ```
 
 **解决**:
@@ -524,7 +524,7 @@ docker compose exec execution tbot query --sql "SELECT symbol, MAX(updated_at) a
 docker compose restart data-syncer
 
 # 检查服务状态
-docker compose exec execution tbot status
+docker compose exec api-service tbot status
 ```
 
 ### 4.4 订单问题
@@ -534,7 +534,7 @@ docker compose exec execution tbot status
 **检查**:
 ```bash
 # 查看最近的订单事件
-docker compose exec execution tbot query --sql "SELECT * FROM order_events ORDER BY created_at DESC LIMIT 20"
+docker compose exec api-service tbot query --sql "SELECT * FROM order_events ORDER BY created_at DESC LIMIT 20"
 
 # 检查账户余额
 # （需要通过API或交易所界面检查）

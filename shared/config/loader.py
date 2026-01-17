@@ -73,22 +73,10 @@ def _parse_csv_env(name: str, *, fallback: str = "", upper: bool = False) -> tup
 
 
 def _build_postgres_url() -> str:
-    """构建PostgreSQL连接URL（支持从旧MySQL参数自动转换）"""
-    # 优先使用POSTGRES_URL
+    """构建PostgreSQL连接URL"""
     postgres_url = os.getenv("POSTGRES_URL", "").strip()
     if postgres_url:
         return postgres_url
-    
-    # 向后兼容：从旧的MySQL参数构建PostgreSQL URL
-    db_host = os.getenv("DB_HOST", "").strip()
-    db_port = os.getenv("DB_PORT", "5432").strip()
-    db_user = os.getenv("DB_USER", "").strip()
-    db_pass = os.getenv("DB_PASS", "").strip()
-    db_name = os.getenv("DB_NAME", "").strip()
-    
-    if db_host and db_user and db_pass and db_name:
-        return f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
-    
     # 默认值
     return "postgresql://postgres:password@postgres:5432/trading_bot"
 
@@ -184,14 +172,7 @@ class Settings:
     stop_rearm_max_attempts: int = int(os.getenv("STOP_REARM_MAX_ATTEMPTS", "2"))
     stop_rearm_cooldown_seconds: int = int(os.getenv("STOP_REARM_COOLDOWN_SECONDS", "60"))
 
-    admin_token: str = os.getenv("ADMIN_TOKEN", "change_me")
-
-    # 支持多 token（逗号/空格分隔），用于密钥轮换；若未设置 ADMIN_TOKENS，则回退 ADMIN_TOKEN
-    admin_tokens: tuple[str, ...] = _parse_csv_env(
-        "ADMIN_TOKENS",
-        fallback=os.getenv("ADMIN_TOKEN", "change_me"),
-        upper=False,
-    )
+    admin_token: str = os.getenv("ADMIN_TOKEN", "change_me_to_long_random_string")
 
     # 管理接口 IP 白名单（CIDR 或单 IP，逗号/空格分隔）。为空则不启用。
     admin_ip_allowlist: tuple[str, ...] = _parse_csv_env("ADMIN_IP_ALLOWLIST", fallback="", upper=False)

@@ -1,49 +1,41 @@
 services:
-  execution:
-    build:
-      context: .
-      dockerfile: services/api_service/Dockerfile
-    env_file: .env
-    environment:
-      - TZ=Asia/Hong_Kong
-    ports:
-      - "8080:8080"
-    volumes:
-      - .:/app
-    # 用于运行trading_test_tool (tbot命令)
-    restart: unless-stopped
-
   api-service:
     build:
       context: .
       dockerfile: services/api_service/Dockerfile
+    container_name: tbot-api-service
     env_file: .env
     environment:
       - TZ=Asia/Hong_Kong
     ports:
-      - "8080:8080"
+      - "9001:8080"
+    volumes:
+      - .:/app
+    # tbot 工具已配置在 api-service 中，可直接使用: docker compose exec api-service tbot <command>
     restart: unless-stopped
 
   data-syncer:
     build:
       context: .
       dockerfile: services/data_syncer/Dockerfile
+    container_name: tbot-data-syncer
     env_file: .env
     environment:
       - TZ=Asia/Hong_Kong
-      - METRICS_PORT=9101
+      - METRICS_PORT=9002
     ports:
-      - "9101:9101"
+      - "9002:9002"
     restart: unless-stopped
 
   strategy-engine:
     build:
       context: .
       dockerfile: services/strategy_engine/Dockerfile
+    container_name: tbot-strategy-engine
     env_file: .env
     environment:
       - TZ=Asia/Hong_Kong
-      - METRICS_PORT=9102
+      - METRICS_PORT=9003
     ports:
-      - "9102:9102"
+      - "9003:9003"
     restart: unless-stopped
