@@ -4,8 +4,11 @@ from __future__ import annotations
 Trading Test Tool - 交易系统管理工具（仅在Docker中使用）
 
 ⚠️ 重要：此工具只能在Docker容器中使用
+
 使用方式：
-    docker compose exec execution python -m scripts.trading_test_tool <command> [args...]
+    方式1: tbot <command> [args...]  (推荐，如果已安装)
+    方式2: python -m scripts.trading_test_tool <command> [args...]
+    方式3: ./scripts/tbot <command> [args...]
 
 命令列表：
     - prepare: 准备检查（检查配置、服务状态等）
@@ -20,11 +23,24 @@ Trading Test Tool - 交易系统管理工具（仅在Docker中使用）
     - list: 列出配置
     - smoke-test: 链路自检
     - e2e-test: 端到端测试
+    - backtest: 历史回测工具（需要token）
+    - query: SQL查询（调试用）
+    - seed: 生成合成测试数据
+    - restart: 重启服务
+    - arm-stop: 启用保护止损订单
+
+使用 --help 查看详细帮助：
+    tbot --help
+    tbot <command> --help
+    
+详细操作指南请查看: OPERATION_GUIDE.md（项目根目录）
 """
 
 import argparse
 import datetime
 import json
+import os
+import subprocess
 import sys
 import time
 from decimal import Decimal
@@ -120,6 +136,21 @@ def require_confirm_cli(settings: Settings, confirm_code: str | None) -> None:
         raise SystemExit("ADMIN_CONFIRM_REQUIRED enabled but ADMIN_CONFIRM_CODE is empty")
     if not confirm_code or confirm_code != settings.admin_confirm_code:
         raise SystemExit("confirm_code required (ADMIN_CONFIRM_REQUIRED=true)")
+
+
+def require_admin_token(settings: Settings, token: str | None) -> None:
+    """验证管理员Token（CLI版本）"""
+    # 如果未提供token，尝试从环境变量读取
+    if not token:
+        token = os.getenv("ADMIN_TOKEN", "").strip()
+    
+    if not token:
+        raise SystemExit("ERROR: Admin token required. Use --token <token> or set ADMIN_TOKEN environment variable")
+    
+    # 检查token是否在允许的token列表中
+    allowed_tokens = set(settings.admin_tokens or [])
+    if token not in allowed_tokens:
+        raise SystemExit("ERROR: Invalid admin token")
 
 
 def _calc_cache_age_seconds(row: Dict[str, Any], interval_minutes: int) -> Optional[int]:
@@ -459,8 +490,21 @@ def run_e2e_trade_test(
 def main() -> None:
     settings = load_settings()
 
-    parser = argparse.ArgumentParser(prog="trading-test-tool", description="交易系统管理工具（仅在Docker中使用）")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser(
+        prog="tbot",
+        description="交易系统管理工具（仅在Docker中使用）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  tbot status                          # 查看系统状态
+  tbot diagnose --symbol BTCUSDT      # 诊断指定交易对
+  tbot backtest --token YOUR_TOKEN    # 历史回测
+  tbot resume --by admin --reason-code ADMIN_RESUME --reason "恢复交易"
+  
+更多信息请查看项目根目录的 OPERATION_GUIDE.md
+        """
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True, help="可用命令")
 
     p_status = sub.add_parser("status", help="查看系统状态（DB/Redis/缓存/开关）")
     p_status.add_argument("--max-age-seconds", type=int, default=120)
@@ -517,6 +561,26 @@ def main() -> None:
 
     p_query = sub.add_parser("query", help="执行SQL查询（仅用于调试）")
     p_query.add_argument("--sql", type=str, required=True, help="SQL查询语句")
+
+    p_backtest = sub.add_parser("backtest", help="历史回测工具：分析Setup B信号出现次数")
+    p_backtest.add_argument("--token", type=str, default=None, help="管理员Token（默认从 ADMIN_TOKEN 环境变量读取）")
+    p_backtest.add_argument("--symbol", type=str, default="BTCUSDT", help="交易对符号（默认：BTCUSDT）")
+    p_backtest.add_argument("--months", type=int, default=6, help="回测月数（默认：6个月）")
+    p_backtest.add_argument("--interval", type=int, default=None, help="K线周期（分钟，默认使用配置）")
+    p_backtest.add_argument("--feature-version", type=int, default=None, dest="feature_version", help="特征版本（默认使用配置）")
+
+    p_seed = sub.add_parser("seed", help="生成合成市场数据（用于测试）")
+    p_seed.add_argument("--bars", type=int, default=260, help="生成的K线数量（默认：260）")
+    p_seed.add_argument("--start-price", type=float, default=40000, dest="start_price", help="起始价格（默认：40000）")
+
+    p_restart = sub.add_parser("restart", help="重启服务")
+    p_restart.add_argument("service", type=str, choices=["data-syncer", "strategy-engine", "api-service", "all"], help="要重启的服务")
+
+    p_arm_stop = sub.add_parser("arm-stop", help="启用保护止损订单")
+    p_arm_stop.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
+    p_arm_stop.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 ADMIN_UPDATE_CONFIG）")
+    p_arm_stop.add_argument("--reason", required=True, help="原因说明")
+    p_arm_stop.add_argument("--stop-poll-seconds", type=int, default=10, dest="stop_poll_seconds", help="止损单轮询间隔（默认：10秒）")
 
     args = parser.parse_args()
 
@@ -625,7 +689,42 @@ def main() -> None:
         finally:
             db.close()
 
-    # 下面是原有简单命令
+    if args.cmd == "backtest":
+        require_admin_token(settings, getattr(args, "token", None))
+        from scripts.trading_test_tool.backtest import run_backtest
+        raise SystemExit(run_backtest(
+            symbol=getattr(args, "symbol", "BTCUSDT"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval", None),
+            feature_version=getattr(args, "feature_version", None),
+        ))
+
+    if args.cmd == "seed":
+        from scripts.trading_test_tool.seed import run_seed
+        raise SystemExit(run_seed(
+            bars=getattr(args, "bars", 260),
+            start_price=getattr(args, "start_price", 40000),
+        ))
+
+    if args.cmd == "restart":
+        service = getattr(args, "service", "all")
+        try:
+            if service == "all":
+                subprocess.run(["docker", "compose", "restart", "data-syncer", "strategy-engine", "api-service"], check=True)
+                print("✅ 已重启所有服务")
+            else:
+                subprocess.run(["docker", "compose", "restart", service], check=True)
+                print(f"✅ 已重启服务: {service}")
+            time.sleep(5)
+            print("✅ 服务重启完成")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ 重启服务失败: {e}", file=sys.stderr)
+            raise SystemExit(1)
+        except FileNotFoundError:
+            print("❌ 错误: 未找到 docker compose 命令，请确保 Docker Compose 已安装", file=sys.stderr)
+            raise SystemExit(1)
+
+    # 下面是原有简单命令（需要 db 和 telegram）
     db = PostgreSQL(settings.postgres_url)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
     trace_id = new_trace_id("admin")
@@ -804,6 +903,44 @@ def main() -> None:
             )
             log_action(logger, action="EMERGENCY_EXIT", trace_id=trace_id, reason_code=args.reason_code,
                        reason=args.reason, client_order_id=None)
+        print(f"OK trace_id={trace_id}")
+        return
+
+    if args.cmd == "arm-stop":
+        expected_reason_code(args.reason_code, "ADMIN_UPDATE_CONFIG")
+        write_system_config(
+            db,
+            actor=args.by,
+            key="USE_PROTECTIVE_STOP_ORDER",
+            value="true",
+            trace_id=trace_id,
+            reason_code=args.reason_code,
+            reason=args.reason,
+        )
+        write_system_config(
+            db,
+            actor=args.by,
+            key="STOP_ORDER_POLL_SECONDS",
+            value=str(getattr(args, "stop_poll_seconds", 10)),
+            trace_id=trace_id,
+            reason_code=args.reason_code,
+            reason=args.reason,
+        )
+        if telegram.enabled():
+            summary_kv = build_system_summary(
+                event="ARM_STOP_ORDER",
+                trace_id=trace_id,
+                level="INFO",
+                actor=args.by,
+                reason_code=args.reason_code,
+                reason=args.reason,
+            )
+            send_system_alert(
+                telegram,
+                title="🛡️ 已启用保护止损",
+                summary_kv=summary_kv,
+                payload={"USE_PROTECTIVE_STOP_ORDER": "true", "STOP_ORDER_POLL_SECONDS": str(getattr(args, "stop_poll_seconds", 10))},
+            )
         print(f"OK trace_id={trace_id}")
         return
 

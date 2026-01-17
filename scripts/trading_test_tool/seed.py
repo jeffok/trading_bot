@@ -1,3 +1,5 @@
+"""生成合成市场数据（用于测试）"""
+
 from __future__ import annotations
 
 import os
@@ -10,7 +12,12 @@ from shared.db import PostgreSQL, migrate
 from services.data_syncer.main import compute_features_for_bars
 
 
-def main() -> None:
+def run_seed(*, bars: int = 260, start_price: float = 40000) -> int:
+    """生成合成市场数据并存储到数据库
+    
+    Returns:
+        0 表示成功，非0表示失败
+    """
     settings = Settings()
     db = PostgreSQL(settings.postgres_url)
     migrate(db, migrations_dir="migrations")
@@ -19,14 +26,14 @@ def main() -> None:
     interval = int(settings.interval_minutes)
 
     # Generate synthetic 15m bars for last ~3 days (288 bars) with gentle uptrend then pullback
-    n = int(os.getenv("SEED_BARS", "260"))
+    n = int(bars)
     now = datetime.now(timezone.utc)
     # align to interval boundary
     base_ts = int(now.timestamp() // (interval * 60) * (interval * 60))
     start_ts = base_ts - n * interval * 60
 
-    bars: List[Dict[str, Any]] = []
-    price = float(os.getenv("SEED_START_PRICE", "40000"))
+    bars_list: List[Dict[str, Any]] = []
+    price = float(start_price)
     for i in range(n):
         t0 = start_ts + i * interval * 60
         open_time_ms = int(t0 * 1000)
@@ -44,7 +51,7 @@ def main() -> None:
         l = min(o, c) * 0.999
         v = 100 + (i % 20) * 2
 
-        bars.append(
+        bars_list.append(
             dict(
                 open_time_ms=open_time_ms,
                 close_time_ms=close_time_ms,
@@ -66,7 +73,7 @@ def main() -> None:
                 "high_price": float(b["high_price"]),
                 "low_price": float(b["low_price"]),
             }
-            for b in bars
+            for b in bars_list
         ],
         ema_fast_period=int(os.getenv("EMA_FAST", "12")),
         ema_slow_period=int(os.getenv("EMA_SLOW", "26")),
@@ -75,7 +82,7 @@ def main() -> None:
 
     # Insert into DB (idempotent by PK)
     with db.tx() as cur:
-        for b, c in zip(bars, feats):
+        for b, c in zip(bars_list, feats):
             cur.execute(
                 """
                 INSERT INTO market_data(symbol, interval_minutes, open_time_ms, close_time_ms, open_price, high_price, low_price, close_price, volume)
@@ -112,7 +119,5 @@ def main() -> None:
             )
 
     print(f"seed ok: symbol={symbol} interval={interval} bars={n}")
-
-
-if __name__ == "__main__":
-    main()
+    db.close()
+    return 0

@@ -1,4 +1,18 @@
 services:
+  execution:
+    build:
+      context: .
+      dockerfile: services/api_service/Dockerfile
+    env_file: .env
+    environment:
+      - TZ=Asia/Hong_Kong
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    # 用于运行trading_test_tool (tbot命令)
+    restart: unless-stopped
+
   api-service:
     build:
       context: .

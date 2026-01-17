@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Trading Bot CLI Tool - 命令行入口脚本
+# 使用方式: ./scripts/tbot <command> [args...]
+# 或: tbot <command> [args...] (如果已安装)
+
+set -e
+
+# 获取脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 如果使用 pip install -e . 安装，直接调用 tbot
+if command -v tbot &> /dev/null; then
+    exec tbot "$@"
+fi
+
+# 否则使用 python -m 方式
+cd "$PROJECT_ROOT"
+exec python3 -m scripts.trading_test_tool "$@"

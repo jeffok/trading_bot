@@ -535,3 +535,88 @@ alpha-sniper-v8/
 - `0001_init.sql`：建表（schema_migrations、service_status、system_config、config_audit、control_commands、order_events、trade_logs、position_snapshots、market_data、market_data_cache、archive_audit、ai_models 等）  
 - `0002_add_reason_fields.sql`：补齐 trace_id/action/reason_code/reason/actor 等字段（如需）  
 - `0003_archive_history_tables.sql`：创建 *_history 表及必要 UNIQUE/索引
+
+---
+
+## 13. 项目需求与架构（V8.0 版本历史）
+
+> **注**: 以下内容来自 V8.0 版本需求文档，已整合到本文档。保留作为历史参考。
+
+### 13.1 核心目标
+
+利用 500 USDT 本金，通过高胜率趋势交易与 AI 优选，实现周盈利 100U - 200U (20% - 40% ROI)。
+
+### 13.2 系统架构与运行时
+
+本版本采用微服务架构思想，确保高可用性、可观测性与自愈能力。
+
+**容器化进程管理**:
+- **基础镜像:** Python 3.11 (Slim)
+- **进程编排:** 三个独立服务（data-syncer / strategy-engine / api-service）
+- **自愈机制**: Docker Healthcheck + 自动重启
+
+**监控与告警**:
+- **Healthcheck:** 暴露 `GET /health` 端点，返回各服务状态
+- **Alerting:** 关键事件通过 Telegram Bot 发送告警
+
+### 13.3 数据库设计：高性能与审计
+
+采用 **PostgreSQL**，数据以JSONB格式存储，针对高频读写、审计溯源进行深度优化。
+
+**高性能存储**:
+- **分区表**: `trade_logs` 按 `timestamp` 进行 RANGE 分区（按月）
+- **预计算缓存**: `market_data_cache` 存储预计算好的 ADX, Squeeze Momentum, EMA 等指标
+
+**审计与事件流**:
+- **不可变事件流**: `order_events` 记录订单全生命周期（CREATED -> SUBMITTED -> FILLED -> CANCELED）
+- **持仓快照**: `position_snapshots` 每 5 分钟或关键事件触发，用于复盘浮盈回撤与保证金变化
+
+**自动归档**:
+- 仅保留最近 90 天的热数据
+- 每日凌晨运行归档任务，将旧数据移动至 `_history` 表
+
+### 13.4 资金管理与风控
+
+**动态"地板"保证金**:
+- 核心逻辑: 单笔交易 **Initial Margin (初始保证金)** ≥ **50 USDT**
+- 计算公式: `Base_Margin = Equity * 10%`, `Final_Margin = max(50, Base_Margin)`
+- AI 增强: 若 AI Score > 85，系数可放大至 1.2
+- 风控约束: 若 `Final_Margin * 杠杆 * 止损距离% > Total_Equity * 3%`，系统优先**降低杠杆**
+
+**强平距离硬约束**:
+- 模式: **强制逐仓 (Isolated Margin)**
+- 杠杆范围: **10x - 20x** (动态调整)
+- 硬性检查: `|Entry - Liq_Price| > 1.5 × |Entry - Stop_Loss|`
+
+### 13.5 策略核心逻辑
+
+**趋势与动量过滤**:
+1. **ADX 趋势强度:** `ADX(14) > 25` 且 `+DI > -DI` (做多)
+2. **挤压动量 (Squeeze Momentum)**:
+   - **Squeeze Release:** 状态由 `On` (挤压) 变为 `Off` (释放)
+   - **Momentum:** 柱状图由负转正 (做多)
+3. **成交量确认:** `Current_Vol > 1.5 * MA(Vol, 5)`
+
+**入场模型组合 (15m Timeframe)**:
+- **Setup A (Trend Pullback)**:
+  - 环境: ADX > 25 (强趋势)
+  - 触发: 回踩 EMA21/55 + 拒绝K线 (Wick) + 吞没形态
+- **Setup B (Squeeze Breakout)**:
+  - 环境: Squeeze Release + Momentum 翻红为绿 + 量能爆发
+
+### 13.6 AI 智能大脑
+
+- **模型:** `SGDClassifier` (Scikit-learn, 支持增量学习)
+- **数据源:** `market_data_cache` (特征) + `trade_logs` (标签)
+- **特征工程:** `ADX_Value`, `Squeeze_Status` (0/1/2), `Vol_Ratio`, `BTC_Correlation`, `RSI_Slope`
+- **训练机制:** 每次平仓 (Close Event) 触发一次 `partial_fit` 更新模型权重
+
+### 13.7 管理与交互
+
+**Admin Tool (CLI)**:
+通过 Docker exec 运行管理工具，无需重启容器：
+```bash
+python -m scripts.trading_test_tool status          # 查看进程与持仓
+python -m scripts.trading_test_tool set             # 热修改参数
+python -m scripts.trading_test_tool emergency-exit  # 一键清仓
+```

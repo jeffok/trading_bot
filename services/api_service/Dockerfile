@@ -17,6 +17,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
-RUN chmod +x /app/scripts/wait_for_db.sh
+RUN chmod +x /app/scripts/wait_for_db.sh \
+    && chmod +x /app/scripts/tbot \
+    && ln -sf /app/scripts/tbot /usr/local/bin/tbot
 
 CMD ["bash","-lc","/app/scripts/wait_for_db.sh && uvicorn services.api_service.main:app --host 0.0.0.0 --port 8080"]
