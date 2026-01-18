@@ -169,6 +169,21 @@
             padding: 40px;
             color: #6b7280;
         }
+        .param-help {
+            margin-top: 5px;
+            padding: 8px;
+            background: #f0f9ff;
+            border-left: 3px solid #2563eb;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #1e40af;
+        }
+        .param-help strong {
+            color: #1e3a8a;
+        }
+        .param-select-wrapper {
+            position: relative;
+        }
         @media (max-width: 768px) {
             .form-row {
                 grid-template-columns: 1fr;
@@ -203,15 +218,43 @@
                 <h2>更新配置</h2>
                 <div id="config-alert"></div>
                 <form id="config-form">
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label>配置键 (KEY)</label>
-                            <input type="text" id="config-key" placeholder="例如: SETUP_B_ADX_MIN" required>
+                    <div class="form-group">
+                        <label>配置参数</label>
+                        <div class="param-select-wrapper">
+                            <select id="config-key-select" onchange="onConfigKeyChange()">
+                                <option value="">-- 选择参数或手动输入 --</option>
+                                <optgroup label="策略参数">
+                                    <option value="SETUP_B_ADX_MIN">SETUP_B_ADX_MIN - ADX最小值</option>
+                                    <option value="SETUP_B_VOL_RATIO_MIN">SETUP_B_VOL_RATIO_MIN - 成交量比率最小值</option>
+                                    <option value="SETUP_B_AI_SCORE_MIN">SETUP_B_AI_SCORE_MIN - AI评分最小值</option>
+                                    <option value="HARD_STOP_LOSS_PCT">HARD_STOP_LOSS_PCT - 硬止损百分比</option>
+                                </optgroup>
+                                <optgroup label="风控参数">
+                                    <option value="ACCOUNT_EQUITY_USDT">ACCOUNT_EQUITY_USDT - 账户权益(USDT)</option>
+                                    <option value="RISK_BUDGET_PCT">RISK_BUDGET_PCT - 风险预算百分比</option>
+                                    <option value="MAX_DRAWDOWN_PCT">MAX_DRAWDOWN_PCT - 最大回撤百分比</option>
+                                    <option value="MAX_CONCURRENT_POSITIONS">MAX_CONCURRENT_POSITIONS - 最大并发持仓数</option>
+                                    <option value="MIN_ORDER_USDT">MIN_ORDER_USDT - 最小订单保证金(USDT)</option>
+                                </optgroup>
+                                <optgroup label="AI参数">
+                                    <option value="AI_ENABLED">AI_ENABLED - AI功能是否启用</option>
+                                    <option value="AI_WEIGHT">AI_WEIGHT - AI权重</option>
+                                    <option value="AI_LR">AI_LR - AI学习率</option>
+                                    <option value="AI_MIN_SAMPLES">AI_MIN_SAMPLES - AI最小样本数</option>
+                                </optgroup>
+                                <optgroup label="其他参数">
+                                    <option value="SYMBOLS">SYMBOLS - 交易对列表</option>
+                                    <option value="USE_PROTECTIVE_STOP_ORDER">USE_PROTECTIVE_STOP_ORDER - 使用保护止损订单</option>
+                                    <option value="STOP_ORDER_POLL_SECONDS">STOP_ORDER_POLL_SECONDS - 止损订单轮询间隔(秒)</option>
+                                </optgroup>
+                            </select>
+                            <input type="text" id="config-key" placeholder="或手动输入参数名（如: SETUP_B_ADX_MIN）" oninput="onConfigKeyInput()">
                         </div>
-                        <div class="form-group">
-                            <label>配置值 (VALUE)</label>
-                            <input type="text" id="config-value" placeholder="例如: 22" required>
-                        </div>
+                        <div id="config-key-help" class="param-help" style="display: none;"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>配置值 (VALUE)</label>
+                        <input type="text" id="config-value" placeholder="请输入配置值" required>
                     </div>
                     <div class="form-group">
                         <label>操作者</label>
@@ -387,6 +430,143 @@
             const alert = document.getElementById(elementId);
             alert.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
             setTimeout(() => alert.innerHTML = '', 5000);
+        }
+
+        // 参数配置映射（说明和参考值）
+        const PARAM_CONFIGS = {
+            'SETUP_B_ADX_MIN': {
+                desc: 'ADX最小值（趋势强度指标），ADX>=此值才考虑入场',
+                example: '20.0',
+                recommended: '18-22'
+            },
+            'SETUP_B_VOL_RATIO_MIN': {
+                desc: '成交量比率最小值，当前成交量/平均成交量>=此值才考虑入场',
+                example: '1.5',
+                recommended: '1.3-1.8'
+            },
+            'SETUP_B_AI_SCORE_MIN': {
+                desc: 'AI评分最小值，AI评分>=此值才考虑入场',
+                example: '55.0',
+                recommended: '50-60'
+            },
+            'HARD_STOP_LOSS_PCT': {
+                desc: '硬止损百分比，单笔交易的最大亏损百分比',
+                example: '0.03',
+                recommended: '0.02-0.05 (2%-5%)'
+            },
+            'ACCOUNT_EQUITY_USDT': {
+                desc: '账户权益（USDT），用于计算风险预算和订单大小',
+                example: '1000.0',
+                recommended: '根据实际账户资金设置'
+            },
+            'RISK_BUDGET_PCT': {
+                desc: '风险预算百分比，每笔交易最多亏损账户权益的百分比',
+                example: '0.03',
+                recommended: '0.01-0.05 (1%-5%)'
+            },
+            'MAX_DRAWDOWN_PCT': {
+                desc: '最大回撤百分比，账户回撤超过此值时触发风控',
+                example: '0.15',
+                recommended: '0.10-0.20 (10%-20%)'
+            },
+            'MAX_CONCURRENT_POSITIONS': {
+                desc: '最大并发持仓数，同时持有的最大仓位数量',
+                example: '3',
+                recommended: '3-10（根据资金量调整）'
+            },
+            'MIN_ORDER_USDT': {
+                desc: '最小订单保证金（USDT），每笔订单的最小保证金要求',
+                example: '50.0',
+                recommended: '50（Bybit等交易所的最低要求）'
+            },
+            'AI_ENABLED': {
+                desc: 'AI功能是否启用，是否启用在线学习AI模型',
+                example: 'true',
+                recommended: 'true（推荐启用）'
+            },
+            'AI_WEIGHT': {
+                desc: 'AI权重，AI评分在最终决策中的权重（0-1）',
+                example: '0.35',
+                recommended: '0.2-0.5'
+            },
+            'AI_LR': {
+                desc: 'AI学习率，在线学习的学习率',
+                example: '0.05',
+                recommended: '0.01-0.1'
+            },
+            'AI_MIN_SAMPLES': {
+                desc: 'AI最小样本数，开始训练所需的最小样本数',
+                example: '50',
+                recommended: '30-100'
+            },
+            'SYMBOLS': {
+                desc: '交易对列表（逗号或空格分隔），如: BTCUSDT,ETHUSDT',
+                example: 'BTCUSDT,ETHUSDT,BNBUSDT',
+                recommended: '根据策略和资金量选择3-20个交易对'
+            },
+            'USE_PROTECTIVE_STOP_ORDER': {
+                desc: '是否使用交易所的止损订单功能',
+                example: 'true',
+                recommended: 'true（推荐）'
+            },
+            'STOP_ORDER_POLL_SECONDS': {
+                desc: '止损订单轮询间隔（秒），检查止损订单状态的间隔',
+                example: '10',
+                recommended: '10'
+            }
+        };
+
+        // 配置键选择变化
+        function onConfigKeyChange() {
+            const select = document.getElementById('config-key-select');
+            const input = document.getElementById('config-key');
+            const help = document.getElementById('config-key-help');
+            const valueInput = document.getElementById('config-value');
+            
+            if (select.value) {
+                input.value = select.value;
+                showParamHelp(select.value, help, valueInput);
+            } else {
+                help.style.display = 'none';
+            }
+        }
+
+        // 配置键手动输入
+        function onConfigKeyInput() {
+            const select = document.getElementById('config-key-select');
+            const input = document.getElementById('config-key');
+            const help = document.getElementById('config-key-help');
+            const valueInput = document.getElementById('config-value');
+            
+            if (input.value && select.value === input.value) {
+                // 如果输入值匹配选择，保持帮助显示
+                return;
+            }
+            if (input.value && PARAM_CONFIGS[input.value.toUpperCase()]) {
+                showParamHelp(input.value.toUpperCase(), help, valueInput);
+            } else {
+                help.style.display = 'none';
+            }
+        }
+
+        // 显示参数帮助
+        function showParamHelp(key, helpEl, valueInput) {
+            const config = PARAM_CONFIGS[key];
+            if (config) {
+                helpEl.innerHTML = `
+                    <strong>${key}</strong><br>
+                    作用：${config.desc}<br>
+                    参考值：${config.recommended}<br>
+                    <span style="color: #6b7280;">示例：${config.example}</span>
+                `;
+                helpEl.style.display = 'block';
+                // 自动填充示例值（如果值为空）
+                if (!valueInput.value) {
+                    valueInput.placeholder = `参考值: ${config.example} (${config.recommended})`;
+                }
+            } else {
+                helpEl.style.display = 'none';
+            }
         }
 
         // 切换标签
