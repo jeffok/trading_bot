@@ -506,6 +506,7 @@ def admin_status(
         }
 
     # market data lag per symbol and latest price
+    # 优先从 market_data 表获取最新价格（WebSocket 实时数据）
     interval_minutes = int(settings.interval_minutes)
     feature_version = int(settings.feature_version)
     md_rows = db.fetch_all(

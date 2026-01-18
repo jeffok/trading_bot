@@ -722,7 +722,36 @@ def _fill_recent_gaps(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, 
     return missing_total
 
 
+def _on_ws_kline_received(db: PostgreSQL, settings: Settings, metrics: Metrics, symbol: str, kline: Kline):
+    """WebSocket K线数据接收回调（实时保存到数据库）"""
+    try:
+        interval = int(settings.interval_minutes)
+        inserted = _insert_market_data(db, symbol=symbol, interval=interval, klines=[kline])
+        
+        if inserted > 0:
+            # 入队预计算任务
+            trace_id = new_trace_id("ws_kline")
+            enq = enqueue_precompute_tasks(
+                db,
+                symbol=symbol,
+                interval_minutes=interval,
+                open_times=[int(kline.open_time_ms)],
+                trace_id=trace_id,
+                feature_version=int(settings.feature_version),
+            )
+            metrics.precompute_tasks_enqueued_total.labels(SERVICE, symbol, str(interval)).inc(enq)
+            metrics.data_sync_cycles_total.labels(SERVICE).inc()
+            logger.debug(f"ws_kline_received symbol={symbol} open_time_ms={kline.open_time_ms} inserted={inserted}")
+        else:
+            # 数据已存在（幂等性），仍然更新指标
+            logger.debug(f"ws_kline_duplicate symbol={symbol} open_time_ms={kline.open_time_ms}")
+    except Exception as e:
+        logger.error(f"ws_kline_received_error symbol={symbol} err={e}", exc_info=True)
+        metrics.data_sync_errors_total.labels(SERVICE).inc()
+
+
 def sync_symbol_once(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, telegram: Telegram, *, symbol: str, instance_id: str, redis_client_instance=None):
+    """同步单个交易对（REST API 方式，仅用于历史数据补齐或 WebSocket 不可用时）"""
     interval = int(settings.interval_minutes)
     interval_ms = interval * 60_000
     trace_id = new_trace_id("sync")
@@ -739,6 +768,7 @@ def sync_symbol_once(db: PostgreSQL, ex, settings: Settings, metrics: Metrics, t
         )
         start_ms = int(last["open_time_ms"]) + interval_ms if last else None
 
+        # 注意：REST API 仅用于历史数据补齐，实时数据通过 WebSocket 获取
         klines = ex.fetch_klines(symbol=symbol, interval_minutes=interval, start_ms=start_ms, limit=1000)
 
         # gap detection within fetched batch (best-effort)
@@ -898,6 +928,30 @@ def main():
         f"symbols={symbols} symbols_from_db={runtime_cfg.symbols_from_db} refresh_seconds={settings.runtime_config_refresh_seconds}"
     )
 
+    # 启动 WebSocket 实时数据同步（替代 REST API 轮询）
+    ws_sync_manager = None
+    try:
+        from services.data_syncer.ws_sync import WebSocketSyncManager
+        
+        def kline_callback(symbol: str, kline: Kline):
+            """WebSocket K线数据回调"""
+            _on_ws_kline_received(db, settings, metrics, symbol, kline)
+        
+        ws_sync_manager = WebSocketSyncManager(
+            exchange=settings.exchange,
+            symbols=symbols,
+            interval_minutes=int(settings.interval_minutes),
+            kline_callback=kline_callback,
+            redis_client=r,
+            service_name=SERVICE,
+        )
+        ws_sync_manager.start()
+        logger.info(f"websocket_sync_started exchange={settings.exchange} symbols={len(symbols)}")
+    except Exception as e:
+        logger.error(f"websocket_sync_start_failed err={e}", exc_info=True)
+        # WebSocket 启动失败时继续使用 REST API（降级模式）
+        logger.warning("Falling back to REST API sync mode")
+
     next_cfg_refresh_ts = time.time() + float(settings.runtime_config_refresh_seconds)
 
     while True:
@@ -949,33 +1003,60 @@ def main():
         # daily archive
         run_daily_archive(db, settings, metrics, instance_id=instance_id)
 
-        for sym in symbols:
-            try:
-                sync_symbol_once(db, ex, settings, metrics, telegram, symbol=sym, instance_id=instance_id, redis_client_instance=r)
-            except RateLimitError as e:
-                sleep_s = e.retry_after_seconds or 2.0
+        # 如果 WebSocket 已连接，主要使用 WebSocket 实时数据
+        # REST API 仅用于：
+        # 1. 历史数据补齐（启动时或检测到缺口时）
+        # 2. WebSocket 不可用时的降级模式
+        use_rest_sync = True
+        if ws_sync_manager and ws_sync_manager.is_connected():
+            # WebSocket 已连接，减少 REST API 使用频率（仅用于历史数据补齐）
+            use_rest_sync = False
+            # 检查是否有数据延迟，如果有则使用 REST 补齐
+            for sym in symbols:
+                status = ws_sync_manager.get_sync_status(sym)
+                kline_ok = status.get("kline_ok", False)
+                last_update = status.get("kline_last_update", 0)
+                now = now_ms()
+                # 如果超过 5 分钟没有更新，使用 REST 补齐
+                if not kline_ok or (now - last_update > 5 * 60 * 1000):
+                    use_rest_sync = True
+                    logger.warning(f"ws_sync_stale symbol={sym} kline_ok={kline_ok} last_update={last_update} using_rest_fallback")
+                    break
+        
+        # REST API 同步（仅在需要时使用）
+        if use_rest_sync:
+            for sym in symbols:
                 try:
-                    telegram.send(f"[RATE_LIMIT] group={e.group} sleep={sleep_s:.2f}s severe={e.severe} sym={sym}")
-                except Exception:
-                    pass
-                time.sleep(max(0.5, float(sleep_s)))
-                continue
-            # process a slice of precompute tasks per symbol each loop
+                    # 仅用于历史数据补齐，不频繁调用
+                    sync_symbol_once(db, ex, settings, metrics, telegram, symbol=sym, instance_id=instance_id, redis_client_instance=r)
+                except RateLimitError as e:
+                    sleep_s = e.retry_after_seconds or 2.0
+                    try:
+                        telegram.send(f"[RATE_LIMIT] group={e.group} sleep={sleep_s:.2f}s severe={e.severe} sym={sym}")
+                    except Exception:
+                        pass
+                    time.sleep(max(0.5, float(sleep_s)))
+                    continue
+                
+                # 添加交易对间延迟，避免突发请求导致速率限制
+                if sym != symbols[-1]:
+                    delay = float(getattr(settings, "data_sync_symbol_delay_seconds", 0.5))
+                    if delay > 0:
+                        time.sleep(delay)
+        
+        # 处理预计算任务（所有交易对）
+        for sym in symbols:
             processed = process_precompute_tasks(db, settings, metrics, symbol=sym, max_tasks=800)
             if processed:
                 logger.info(f"precompute_done symbol={sym} processed={processed}")
-            
-            # 添加交易对间延迟，避免突发请求导致速率限制
-            # 每个交易对间隔可配置，默认0.5秒，20个交易对约10秒，加上处理时间，总循环约20-30秒
-            if sym != symbols[-1]:  # 最后一个交易对不需要延迟
-                delay = float(getattr(settings, "data_sync_symbol_delay_seconds", 0.5))
-                if delay > 0:
-                    time.sleep(delay)
 
-        # 可配置的基础同步间隔，默认30秒（相比原来10秒减少67%请求频率）
-        # 20个交易对 × 0.5秒延迟 + 30秒基础间隔 = 每分钟约40次请求（原来120次）
-        # 如果仍有速率限制问题，可以通过环境变量 DATA_SYNC_LOOP_INTERVAL_SECONDS=60 进一步增加
-        loop_interval = float(getattr(settings, "data_sync_loop_interval_seconds", 30.0))
+        # 如果使用 WebSocket，循环间隔可以更长（主要用于处理预计算任务和检查状态）
+        # REST API 模式保持原有间隔
+        if use_rest_sync:
+            loop_interval = float(getattr(settings, "data_sync_loop_interval_seconds", 30.0))
+        else:
+            # WebSocket 模式：主要用于预计算任务处理，间隔可以更长
+            loop_interval = float(getattr(settings, "data_sync_loop_interval_seconds", 60.0))
         time.sleep(loop_interval)
 
 
