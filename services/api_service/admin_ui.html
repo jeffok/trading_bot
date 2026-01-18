@@ -155,10 +155,51 @@
         .config-item .value {
             color: #6b7280;
             font-family: monospace;
+            word-break: break-all;
+        }
+        .config-item .value-array {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 5px;
+        }
+        .config-item .value-tag {
+            display: inline-block;
+            padding: 4px 10px;
+            background: #e0e7ff;
+            color: #3730a3;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: 'Courier New', monospace;
+            font-weight: 500;
         }
         .config-item .actions {
             display: flex;
             gap: 8px;
+        }
+        .symbols-display {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 5px;
+        }
+        .symbol-tag {
+            display: inline-block;
+            padding: 4px 10px;
+            background: #e0e7ff;
+            color: #3730a3;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: 'Courier New', monospace;
+            font-weight: 500;
+        }
+        .status-item {
+            margin-bottom: 15px;
+        }
+        .status-item-label {
+            font-weight: 500;
+            color: #374151;
+            margin-bottom: 5px;
         }
         .btn-sm {
             padding: 6px 12px;
@@ -339,14 +380,25 @@
             const status = await apiCall('GET', '/admin/status');
             if (!status) return;
 
+            const symbols = status.config.EFFECTIVE_SYMBOLS || [];
+            const symbolsHtml = symbols.length > 0 
+                ? `<div class="symbols-display">${symbols.map(s => `<span class="symbol-tag">${s}</span>`).join('')}</div>`
+                : '<span style="color: #9ca3af;">暂无交易对</span>';
+
             const statusHtml = `
-                <div class="form-row">
-                    <div><strong>交易所:</strong> ${status.config.EXCHANGE}</div>
-                    <div><strong>交易对:</strong> ${status.config.EFFECTIVE_SYMBOLS.join(', ')}</div>
-                    <div><strong>暂停交易:</strong> ${status.config.HALT_TRADING ? '是' : '否'}</div>
-                    <div><strong>紧急退出:</strong> ${status.config.EMERGENCY_EXIT ? '是' : '否'}</div>
-                    <div><strong>持仓数:</strong> ${status.open_positions}</div>
-                    <div><strong>服务数:</strong> ${Object.keys(status.services).length}</div>
+                <div class="status-item">
+                    <div class="status-item-label">交易所</div>
+                    <div>${status.config.EXCHANGE || '未知'}</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-item-label">交易对 <span style="color: #6b7280; font-weight: normal;">(${symbols.length}个)</span></div>
+                    ${symbolsHtml}
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-top: 20px;">
+                    <div><strong>暂停交易:</strong> <span style="color: ${status.config.HALT_TRADING ? '#dc2626' : '#16a34a'}">${status.config.HALT_TRADING ? '是' : '否'}</span></div>
+                    <div><strong>紧急退出:</strong> <span style="color: ${status.config.EMERGENCY_EXIT ? '#dc2626' : '#16a34a'}">${status.config.EMERGENCY_EXIT ? '是' : '否'}</span></div>
+                    <div><strong>持仓数:</strong> ${status.open_positions || 0}</div>
+                    <div><strong>服务数:</strong> ${Object.keys(status.services || {}).length}</div>
                 </div>
             `;
             document.getElementById('status-info').innerHTML = statusHtml;
@@ -359,14 +411,30 @@
             if (!status) return;
 
             const configs = status.config;
-            const configList = Object.entries(configs).map(([key, value]) => `
+            const configList = Object.entries(configs).map(([key, value]) => {
+                let valueHtml = '';
+                if (Array.isArray(value) && key === 'EFFECTIVE_SYMBOLS') {
+                    // 特殊处理 EFFECTIVE_SYMBOLS，显示为标签
+                    valueHtml = `<div class="value-array">${value.map(s => `<span class="value-tag">${s}</span>`).join('')}</div>`;
+                } else if (Array.isArray(value)) {
+                    // 其他数组也显示为标签
+                    valueHtml = `<div class="value-array">${value.map(v => `<span class="value-tag">${v}</span>`).join('')}</div>`;
+                } else if (typeof value === 'boolean') {
+                    // 布尔值用颜色区分
+                    valueHtml = `<span style="color: ${value ? '#16a34a' : '#dc2626'}">${value ? 'true' : 'false'}</span>`;
+                } else {
+                    // 普通值
+                    valueHtml = `<span class="value">${JSON.stringify(value)}</span>`;
+                }
+                return `
                 <div class="config-item">
                     <div>
                         <div class="key">${key}</div>
-                        <div class="value">${JSON.stringify(value)}</div>
+                        ${valueHtml}
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
             document.getElementById('config-list').innerHTML = configList || '<div>暂无配置</div>';
         }
 

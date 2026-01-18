@@ -1,10 +1,108 @@
 # Trading Bot 操作指南
 
-本文档提供交易系统的完整操作指南，包括 tbot 工具使用、诊断、参数配置和故障排除。
+本文档提供交易系统的完整操作指南，包括 Web 管理界面、tbot 工具使用、诊断、参数配置和故障排除。
 
 ---
 
-## 一、tbot 工具使用指南
+## 一、Web 管理界面使用指南
+
+### 1.1 访问地址
+
+**管理界面地址：**
+```
+http://localhost:9001/admin/ui
+```
+
+**如何查看地址：**
+- 本地开发：`http://localhost:9001/admin/ui`
+- 服务器部署：`http://<服务器IP>:9001/admin/ui`
+- 如果配置了域名：`http://<域名>:9001/admin/ui`
+
+### 1.2 访问方式
+
+#### 方法 1：直接在浏览器打开（推荐）
+
+1. 确保服务已启动：
+   ```bash
+   docker compose ps
+   ```
+
+2. 在浏览器中打开：
+   ```
+   http://localhost:9001/admin/ui
+   ```
+
+3. 输入管理员 Token：
+   - 首次访问会提示输入 Token
+   - Token 来自 `.env` 文件中的 `ADMIN_TOKEN` 配置
+   - 查看 Token：`cat .env | grep ADMIN_TOKEN`
+
+4. 或者通过 URL 参数传递：
+   ```
+   http://localhost:9001/admin/ui?token=YOUR_ADMIN_TOKEN
+   ```
+
+#### 方法 2：通过命令行检查服务状态
+
+```bash
+# 检查 API 服务是否运行
+curl http://localhost:9001/health
+
+# 查看服务日志（确认端口）
+docker compose logs api-service | grep -i "uvicorn\|port\|start"
+```
+
+### 1.3 管理界面功能
+
+Web 管理界面提供以下功能：
+
+1. **系统状态查看**
+   - 交易所配置
+   - 交易对列表
+   - 暂停/紧急退出状态
+   - 持仓数量
+   - 服务运行状态
+
+2. **配置管理**
+   - 更新策略参数（ADX、成交量比率、AI评分等）
+   - 更新风控参数（账户权益、风险预算、最大回撤等）
+   - 更新 AI 参数（AI权重、学习率等）
+   - 所有参数都有说明和参考值提示
+
+3. **控制操作**
+   - 暂停交易
+   - 恢复交易
+   - 紧急退出（清仓）
+
+### 1.4 认证说明
+
+- **认证方式**：Bearer Token
+- **Token 位置**：`.env` 文件中的 `ADMIN_TOKEN`
+- **查看 Token**：
+  ```bash
+  docker compose exec api-service cat /app/.env | grep ADMIN_TOKEN
+  # 或者
+  cat .env | grep ADMIN_TOKEN
+  ```
+
+### 1.5 常见问题
+
+**Q: 无法访问管理界面？**
+- 检查服务是否运行：`docker compose ps`
+- 检查端口是否暴露：确认 `docker-compose.yml` 中 `api-service` 的端口映射为 `9001:8080`
+- 检查防火墙：确认端口 9001 未被阻止
+
+**Q: 提示 Token 无效？**
+- 确认 `.env` 文件中的 `ADMIN_TOKEN` 配置正确
+- 确认 URL 中的 token 参数正确（区分大小写）
+
+**Q: 如何修改 Token？**
+- 编辑 `.env` 文件，修改 `ADMIN_TOKEN`
+- 重启服务：`docker compose restart api-service`
+
+---
+
+## 二、tbot 工具使用指南
 
 ### 1.1 工具简介
 
