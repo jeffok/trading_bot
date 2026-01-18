@@ -308,9 +308,36 @@ def health(settings: Settings = Depends(get_settings), db: PostgreSQL = Depends(
             status_json = json.loads(r["status_json"]) if isinstance(r["status_json"], str) else r["status_json"]
         except Exception:
             status_json = {"raw": r["status_json"]}
+        
+        # 处理时间戳：转换为 ISO 格式（带时区），便于前端解析
+        # 数据库存储的是 UTC 时间，需要明确标注时区
+        last_heartbeat = r["last_heartbeat"]
+        if isinstance(last_heartbeat, datetime):
+            # 如果是 datetime 对象，转换为 ISO 格式字符串（UTC）
+            if last_heartbeat.tzinfo is None:
+                # 如果没有时区信息，假设是 UTC
+                last_heartbeat_utc = last_heartbeat.replace(tzinfo=timezone.utc)
+            else:
+                last_heartbeat_utc = last_heartbeat
+            last_heartbeat_str = last_heartbeat_utc.isoformat()
+        else:
+            # 如果是字符串，尝试解析并转换为 ISO 格式
+            try:
+                # PostgreSQL 返回的格式可能是 '2026-01-18 11:43:12'
+                # 假设是 UTC 时间
+                if isinstance(last_heartbeat, str) and ' ' in last_heartbeat:
+                    dt_str = last_heartbeat.replace(' ', 'T')
+                    if '+' not in dt_str and 'Z' not in dt_str:
+                        dt_str += '+00:00'  # 添加 UTC 时区
+                    last_heartbeat_str = dt_str
+                else:
+                    last_heartbeat_str = str(last_heartbeat)
+            except Exception:
+                last_heartbeat_str = str(last_heartbeat)
+        
         services[name] = {
             "instance_id": r["instance_id"],
-            "last_heartbeat": str(r["last_heartbeat"]),
+            "last_heartbeat": last_heartbeat_str,
             "status": status_json,
         }
 
@@ -499,9 +526,36 @@ def admin_status(
             status_json = json.loads(r["status_json"]) if isinstance(r["status_json"], str) else r["status_json"]
         except Exception:
             status_json = {"raw": r["status_json"]}
+        
+        # 处理时间戳：转换为 ISO 格式（带时区），便于前端解析
+        # 数据库存储的是 UTC 时间，需要明确标注时区
+        last_heartbeat = r["last_heartbeat"]
+        if isinstance(last_heartbeat, datetime):
+            # 如果是 datetime 对象，转换为 ISO 格式字符串（UTC）
+            if last_heartbeat.tzinfo is None:
+                # 如果没有时区信息，假设是 UTC
+                last_heartbeat_utc = last_heartbeat.replace(tzinfo=timezone.utc)
+            else:
+                last_heartbeat_utc = last_heartbeat
+            last_heartbeat_str = last_heartbeat_utc.isoformat()
+        else:
+            # 如果是字符串，尝试解析并转换为 ISO 格式
+            try:
+                # PostgreSQL 返回的格式可能是 '2026-01-18 11:43:12'
+                # 假设是 UTC 时间
+                if isinstance(last_heartbeat, str) and ' ' in last_heartbeat:
+                    dt_str = last_heartbeat.replace(' ', 'T')
+                    if '+' not in dt_str and 'Z' not in dt_str:
+                        dt_str += '+00:00'  # 添加 UTC 时区
+                    last_heartbeat_str = dt_str
+                else:
+                    last_heartbeat_str = str(last_heartbeat)
+            except Exception:
+                last_heartbeat_str = str(last_heartbeat)
+        
         services[name] = {
             "instance_id": r["instance_id"],
-            "last_heartbeat": str(r["last_heartbeat"]),
+            "last_heartbeat": last_heartbeat_str,
             "status": status_json,
         }
 
