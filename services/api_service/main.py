@@ -505,13 +505,18 @@ def admin_status(
             "status": status_json,
         }
 
-    # market data lag per symbol
+    # market data lag per symbol and latest price
     md_rows = db.fetch_all(
         """
-        SELECT symbol, MAX(open_time_ms) AS last_open_time_ms
-        FROM market_data_cache
-        WHERE interval_minutes=%s AND feature_version=%s
-        GROUP BY symbol
+        SELECT 
+            c.symbol, 
+            MAX(c.open_time_ms) AS last_open_time_ms,
+            (SELECT close_price FROM market_data 
+             WHERE symbol=c.symbol AND interval_minutes=c.interval_minutes 
+             ORDER BY open_time_ms DESC LIMIT 1) AS latest_price
+        FROM market_data_cache c
+        WHERE c.interval_minutes=%s AND c.feature_version=%s
+        GROUP BY c.symbol
         """,
         (int(settings.interval_minutes), int(settings.feature_version)),
     )
@@ -520,7 +525,13 @@ def admin_status(
     for r in md_rows or []:
         last_ot = int(r["last_open_time_ms"]) if r["last_open_time_ms"] is not None else None
         lag_ms = (now_ms - last_ot) if last_ot else None
-        data_lag.append({"symbol": r["symbol"], "last_open_time_ms": last_ot, "lag_ms": lag_ms})
+        latest_price = float(r["latest_price"]) if r["latest_price"] is not None else None
+        data_lag.append({
+            "symbol": r["symbol"], 
+            "last_open_time_ms": last_ot, 
+            "lag_ms": lag_ms,
+            "latest_price": latest_price
+        })
 
     # open positions: latest snapshot per symbol base_qty>0
     pos_rows = db.fetch_all(

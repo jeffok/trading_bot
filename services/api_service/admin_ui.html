@@ -223,47 +223,39 @@
             font-size: 14px;
             color: #6b7280;
         }
-        .config-table {
+        .symbol-status-table {
             width: 100%;
             border-collapse: collapse;
             margin-top: 10px;
         }
-        .config-table th,
-        .config-table td {
-            padding: 12px;
+        .symbol-status-table th,
+        .symbol-status-table td {
+            padding: 10px;
             text-align: left;
             border-bottom: 1px solid #e5e7eb;
         }
-        .config-table th {
+        .symbol-status-table th {
             background: #f9fafb;
             font-weight: 500;
             color: #374151;
-            width: 40%;
         }
-        .config-table td {
+        .symbol-status-table td {
             color: #6b7280;
-            vertical-align: top;
         }
-        .config-table tr:hover {
+        .symbol-status-table tr:hover {
             background: #f9fafb;
         }
-        .config-table .value-array {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            align-items: flex-start;
-            text-align: left;
-        }
-        .config-table .value-tag {
-            display: inline-block;
-            padding: 4px 10px;
-            background: #e0e7ff;
-            color: #3730a3;
-            border-radius: 4px;
-            font-size: 13px;
-            font-family: 'Courier New', monospace;
+        .sync-status-ok {
+            color: #16a34a;
             font-weight: 500;
-            white-space: nowrap;
+        }
+        .sync-status-lag {
+            color: #f59e0b;
+            font-weight: 500;
+        }
+        .sync-status-error {
+            color: #dc2626;
+            font-weight: 500;
         }
         .btn-sm {
             padding: 6px 12px;
@@ -378,10 +370,6 @@
                 </form>
             </div>
 
-            <div class="card">
-                <h2>当前配置列表</h2>
-                <div id="config-list" class="loading">加载中...</div>
-            </div>
         </div>
 
         <!-- 控制操作 -->
@@ -453,18 +441,38 @@
             const serviceNames = ['api-service', 'data-syncer', 'strategy-engine'];
             const servicesHtml = serviceNames.map(name => {
                 const service = services[name];
-                const lastHeartbeat = service ? new Date(service.last_heartbeat).toLocaleString('zh-CN') : '无数据';
-                const statusInfo = service && service.status ? service.status : {};
-                const role = statusInfo.role || '未知';
-                const leader = statusInfo.leader || '未知';
-                const isRunning = service && (Date.now() - new Date(service.last_heartbeat).getTime() < 120000); // 2分钟内
+                if (!service || !service.last_heartbeat) {
+                    return `
+                        <div class="service-card">
+                            <h3>${name}</h3>
+                            <div class="status-line"><strong>状态:</strong> <span style="color: #dc2626">离线</span></div>
+                            <div class="status-line"><strong>实例ID:</strong> N/A</div>
+                            <div class="status-line"><strong>最后心跳:</strong> 无数据</div>
+                        </div>
+                    `;
+                }
+                // 处理时间戳格式（可能是 ISO 字符串或时间戳）
+                let heartbeatTime;
+                try {
+                    heartbeatTime = new Date(service.last_heartbeat);
+                    if (isNaN(heartbeatTime.getTime())) {
+                        // 如果不是有效日期，尝试作为字符串解析
+                        heartbeatTime = new Date(service.last_heartbeat.replace(' ', 'T'));
+                    }
+                } catch (e) {
+                    heartbeatTime = null;
+                }
+                
+                const now = Date.now();
+                const heartbeatMs = heartbeatTime ? heartbeatTime.getTime() : 0;
+                const isRunning = heartbeatMs > 0 && (now - heartbeatMs < 120000); // 2分钟内
+                const lastHeartbeat = heartbeatTime ? heartbeatTime.toLocaleString('zh-CN') : service.last_heartbeat;
                 
                 return `
                     <div class="service-card">
                         <h3>${name}</h3>
                         <div class="status-line"><strong>状态:</strong> <span style="color: ${isRunning ? '#16a34a' : '#dc2626'}">${isRunning ? '运行中' : '离线'}</span></div>
-                        <div class="status-line"><strong>角色:</strong> ${role}</div>
-                        <div class="status-line"><strong>实例ID:</strong> ${service ? service.instance_id : 'N/A'}</div>
+                        <div class="status-line"><strong>实例ID:</strong> ${service.instance_id || 'N/A'}</div>
                         <div class="status-line"><strong>最后心跳:</strong> ${lastHeartbeat}</div>
                     </div>
                 `;
@@ -488,9 +496,74 @@
                     <h2 style="grid-column: 1 / -1; margin-bottom: 10px;">服务状态</h2>
                     ${servicesHtml}
                 </div>
+                <div class="status-item" style="margin-top: 30px;">
+                    <div class="status-item-label">交易对同步状态</div>
+                    <div id="symbol-status-table-container"></div>
+                </div>
             `;
             document.getElementById('status-info').innerHTML = statusHtml;
             document.getElementById('status').textContent = `最后更新: ${new Date().toLocaleString('zh-CN')}`;
+            
+            // 加载交易对同步状态表格
+            loadSymbolStatusTable(status.data_lag || []);
+        }
+        
+        // 加载交易对同步状态表格
+        function loadSymbolStatusTable(dataLag) {
+            const container = document.getElementById('symbol-status-table-container');
+            if (!container) return;
+            
+            if (!dataLag || dataLag.length === 0) {
+                container.innerHTML = '<div style="color: #9ca3af; padding: 20px;">暂无数据</div>';
+                return;
+            }
+            
+            const rows = dataLag.map(item => {
+                const symbol = item.symbol || '';
+                const price = item.latest_price !== null && item.latest_price !== undefined 
+                    ? parseFloat(item.latest_price).toFixed(4) 
+                    : 'N/A';
+                const lagMs = item.lag_ms;
+                
+                let syncStatus, statusClass;
+                if (lagMs === null || lagMs === undefined) {
+                    syncStatus = '无数据';
+                    statusClass = 'sync-status-error';
+                } else if (lagMs < 60000) { // 小于1分钟
+                    syncStatus = '正常';
+                    statusClass = 'sync-status-ok';
+                } else if (lagMs < 300000) { // 小于5分钟
+                    syncStatus = `延迟 ${Math.floor(lagMs / 1000)}秒`;
+                    statusClass = 'sync-status-lag';
+                } else {
+                    syncStatus = `严重延迟 ${Math.floor(lagMs / 60000)}分钟`;
+                    statusClass = 'sync-status-error';
+                }
+                
+                return `
+                    <tr>
+                        <td><strong>${symbol}</strong></td>
+                        <td><span class="${statusClass}">${syncStatus}</span></td>
+                        <td>${price}</td>
+                    </tr>
+                `;
+            }).join('');
+            
+            const table = `
+                <table class="symbol-status-table">
+                    <thead>
+                        <tr>
+                            <th>交易对</th>
+                            <th>同步状态</th>
+                            <th>当前价格</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${rows}
+                    </tbody>
+                </table>
+            `;
+            container.innerHTML = table;
         }
 
         // 当前配置数据（用于显示当前值）
@@ -782,7 +855,20 @@
             event.target.classList.add('active');
             document.getElementById(`${tab}-tab`).classList.add('active');
 
-            if (tab === 'status') loadStatus();
+            if (tab === 'status') {
+                loadStatus();
+                // 每5秒自动刷新交易对同步状态
+                if (window.symbolStatusInterval) {
+                    clearInterval(window.symbolStatusInterval);
+                }
+                window.symbolStatusInterval = setInterval(loadStatus, 5000);
+            } else {
+                // 离开状态页时停止自动刷新
+                if (window.symbolStatusInterval) {
+                    clearInterval(window.symbolStatusInterval);
+                    window.symbolStatusInterval = null;
+                }
+            }
             if (tab === 'config') { 
                 loadConfigs().then(() => {
                     // 配置加载完成后，如果已选择参数，更新当前值显示
@@ -807,7 +893,7 @@
             }
             await loadStatus();
             await loadConfigs();
-            setInterval(loadStatus, 30000); // 每30秒刷新状态
+            setInterval(loadStatus, 5000); // 每5秒刷新状态（包含交易对同步状态）
         })();
     </script>
 </body>
