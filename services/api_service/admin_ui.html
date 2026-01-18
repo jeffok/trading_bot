@@ -451,29 +451,82 @@
                         </div>
                     `;
                 }
-                // 处理时间戳格式（可能是 ISO 字符串或时间戳）
+                // 处理时间戳格式（可能是 ISO 字符串或 PostgreSQL 时间戳格式）
                 let heartbeatTime;
+                let parseError = null;
                 try {
-                    heartbeatTime = new Date(service.last_heartbeat);
-                    if (isNaN(heartbeatTime.getTime())) {
-                        // 如果不是有效日期，尝试作为字符串解析
-                        heartbeatTime = new Date(service.last_heartbeat.replace(' ', 'T'));
+                    const hbStr = String(service.last_heartbeat || '').trim();
+                    if (!hbStr) {
+                        heartbeatTime = null;
+                    } else {
+                        // PostgreSQL 返回的时间戳格式可能是：
+                        // - 2026-01-18 19:35:51.123456
+                        // - 2026-01-18T19:35:51.123456
+                        // - 2026-01-18T19:35:51.123456+00:00
+                        // - 2026-01-18T19:35:51Z
+                        
+                        // 先尝试直接解析
+                        heartbeatTime = new Date(hbStr);
+                        
+                        // 如果失败，尝试标准化格式
+                        if (isNaN(heartbeatTime.getTime())) {
+                            // 替换空格为 T
+                            let normalized = hbStr.replace(' ', 'T');
+                            
+                            // 移除时区后缀（如果有）
+                            if (normalized.includes('+')) {
+                                normalized = normalized.split('+')[0];
+                            } else if (normalized.endsWith('Z')) {
+                                normalized = normalized.slice(0, -1);
+                            }
+                            
+                            // 如果包含小数点，保留；否则添加秒
+                            if (!normalized.includes('.')) {
+                                // 如果没有秒，添加 :00
+                                if (normalized.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/)) {
+                                    normalized += ':00';
+                                }
+                            }
+                            
+                            heartbeatTime = new Date(normalized);
+                            
+                            // 如果还是失败，尝试其他格式
+                            if (isNaN(heartbeatTime.getTime())) {
+                                // 尝试作为 UTC 时间解析
+                                heartbeatTime = new Date(hbStr + ' UTC');
+                            }
+                        }
+                        
+                        // 最后检查
+                        if (isNaN(heartbeatTime.getTime())) {
+                            heartbeatTime = null;
+                            parseError = `无法解析: ${hbStr}`;
+                        }
                     }
                 } catch (e) {
                     heartbeatTime = null;
+                    parseError = `解析错误: ${e.message}`;
+                    console.warn(`[${name}] Failed to parse heartbeat time:`, service.last_heartbeat, e);
                 }
                 
                 const now = Date.now();
                 const heartbeatMs = heartbeatTime ? heartbeatTime.getTime() : 0;
-                const isRunning = heartbeatMs > 0 && (now - heartbeatMs < 120000); // 2分钟内
-                const lastHeartbeat = heartbeatTime ? heartbeatTime.toLocaleString('zh-CN') : service.last_heartbeat;
+                // 判断是否在线：2分钟内有心跳
+                const isRunning = heartbeatMs > 0 && (now - heartbeatMs < 120000);
+                const timeDiff = heartbeatMs > 0 ? Math.floor((now - heartbeatMs) / 1000) : null;
+                const lastHeartbeat = heartbeatTime 
+                    ? heartbeatTime.toLocaleString('zh-CN') 
+                    : (parseError || service.last_heartbeat || '无数据');
+                
+                // 添加调试信息（开发时可见）
+                const debugInfo = parseError ? ` <span style="color: #f59e0b; font-size: 12px;">(${parseError})</span>` : '';
                 
                 return `
                     <div class="service-card">
                         <h3>${name}</h3>
-                        <div class="status-line"><strong>状态:</strong> <span style="color: ${isRunning ? '#16a34a' : '#dc2626'}">${isRunning ? '运行中' : '离线'}</span></div>
+                        <div class="status-line"><strong>状态:</strong> <span style="color: ${isRunning ? '#16a34a' : '#dc2626'}">${isRunning ? '运行中' : '离线'}</span>${timeDiff !== null ? ` <span style="color: #6b7280; font-size: 12px;">(${timeDiff}秒前)</span>` : ''}</div>
                         <div class="status-line"><strong>实例ID:</strong> ${service.instance_id || 'N/A'}</div>
-                        <div class="status-line"><strong>最后心跳:</strong> ${lastHeartbeat}</div>
+                        <div class="status-line"><strong>最后心跳:</strong> ${lastHeartbeat}${debugInfo}</div>
                     </div>
                 `;
             }).join('');

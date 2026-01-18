@@ -972,9 +972,12 @@ def main():
                 db,
                 service_name=SERVICE,
                 instance_id=instance_id,
-                trace_id=new_trace_id("hb"),
-                status=role,
-                extra={"leader": elector.get_leader() if settings.leader_election_enabled else instance_id},
+                status={
+                    "status": "RUNNING",
+                    "role": role,
+                    "leader": elector.get_leader() if settings.leader_election_enabled else instance_id,
+                    "trace_id": new_trace_id("hb"),
+                },
             )
         except Exception:
             pass
