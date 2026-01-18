@@ -8,7 +8,7 @@ services:
     environment:
       - TZ=Asia/Hong_Kong
     ports:
-      - "9001:8080"
+      - "9001:9001"
     volumes:
       - .:/app
     # tbot 工具已配置在 api-service 中，可直接使用: docker compose exec api-service tbot <command>

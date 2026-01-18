@@ -21,4 +21,4 @@ RUN chmod +x /app/scripts/wait_for_db.sh \
     && chmod +x /app/scripts/tbot \
     && ln -sf /app/scripts/tbot /usr/local/bin/tbot
 
-CMD ["bash","-lc","/app/scripts/wait_for_db.sh && uvicorn services.api_service.main:app --host 0.0.0.0 --port 8080"]
+CMD ["bash","-lc","/app/scripts/wait_for_db.sh && uvicorn services.api_service.main:app --host 0.0.0.0 --port 9001"]
