@@ -271,16 +271,32 @@ class BybitWebSocketClient:
         while self._running:
             try:
                 await asyncio.sleep(self.ping_interval)
-                if ws and not ws.closed:
-                    ping_msg = {"op": "ping"}
-                    await ws.send(json.dumps(ping_msg))
-                    _logger.debug(f"[{self.service_name}] Sent ping ({'private' if is_private else 'public'})")
+                if ws:
+                    # 检查连接是否关闭（兼容不同版本的 websockets 库）
+                    is_closed = False
+                    try:
+                        is_closed = ws.closed
+                    except AttributeError:
+                        # websockets 14.x 可能使用不同的属性
+                        try:
+                            is_closed = ws.close_code is not None
+                        except AttributeError:
+                            pass
+                    
+                    if not is_closed:
+                        ping_msg = {"op": "ping"}
+                        await ws.send(json.dumps(ping_msg))
+                        _logger.debug(f"[{self.service_name}] Sent ping ({'private' if is_private else 'public'})")
             except Exception as e:
                 _logger.warning(f"[{self.service_name}] Ping error: {e}")
                 break
 
     async def _reconnect_loop(self, is_private: bool):
         """重连循环"""
+        # 私有频道重连循环：只在有 API key 时运行
+        if is_private and (not self.api_key or not self.api_secret):
+            return
+        
         while self._running:
             if is_private:
                 if self.private_connected:
@@ -317,7 +333,7 @@ class BybitWebSocketClient:
         self._running = True
         _logger.info(f"[{self.service_name}] Starting Bybit WebSocket client")
 
-        # 连接公共频道
+        # 连接公共频道（公共接口，无需认证）
         await self._connect_public()
         if self.public_connected:
             task = asyncio.create_task(self._handle_message(self.public_ws, is_private=False))
@@ -325,19 +341,22 @@ class BybitWebSocketClient:
             task = asyncio.create_task(self._ping_loop(self.public_ws, is_private=False))
             self._tasks.append(task)
         
-        # 连接私有频道
-        await self._connect_private()
-        if self.private_connected:
-            task = asyncio.create_task(self._handle_message(self.private_ws, is_private=True))
-            self._tasks.append(task)
-            task = asyncio.create_task(self._ping_loop(self.private_ws, is_private=True))
-            self._tasks.append(task)
+        # 连接私有频道（仅在有 API key 时连接）
+        if self.api_key and self.api_secret:
+            await self._connect_private()
+            if self.private_connected:
+                task = asyncio.create_task(self._handle_message(self.private_ws, is_private=True))
+                self._tasks.append(task)
+                task = asyncio.create_task(self._ping_loop(self.private_ws, is_private=True))
+                self._tasks.append(task)
         
         # 启动重连循环
         task = asyncio.create_task(self._reconnect_loop(is_private=False))
         self._tasks.append(task)
-        task = asyncio.create_task(self._reconnect_loop(is_private=True))
-        self._tasks.append(task)
+        # 只在有 API key 时启动私有频道重连循环
+        if self.api_key and self.api_secret:
+            task = asyncio.create_task(self._reconnect_loop(is_private=True))
+            self._tasks.append(task)
 
     async def stop(self):
         """停止 WebSocket 客户端"""
@@ -352,11 +371,25 @@ class BybitWebSocketClient:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-        # 关闭连接
-        if self.public_ws and not self.public_ws.closed:
-            await self.public_ws.close()
-        if self.private_ws and not self.private_ws.closed:
-            await self.private_ws.close()
+        # 关闭连接（兼容不同版本的 websockets 库）
+        if self.public_ws:
+            try:
+                is_closed = getattr(self.public_ws, 'closed', None)
+                if is_closed is None:
+                    is_closed = getattr(self.public_ws, 'close_code', None) is not None
+                if not is_closed:
+                    await self.public_ws.close()
+            except Exception:
+                pass
+        if self.private_ws:
+            try:
+                is_closed = getattr(self.private_ws, 'closed', None)
+                if is_closed is None:
+                    is_closed = getattr(self.private_ws, 'close_code', None) is not None
+                if not is_closed:
+                    await self.private_ws.close()
+            except Exception:
+                pass
         
         self.public_connected = False
         self.private_connected = False
