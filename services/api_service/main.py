@@ -506,19 +506,21 @@ def admin_status(
         }
 
     # market data lag per symbol and latest price
+    interval_minutes = int(settings.interval_minutes)
+    feature_version = int(settings.feature_version)
     md_rows = db.fetch_all(
         """
         SELECT 
             c.symbol, 
             MAX(c.open_time_ms) AS last_open_time_ms,
-            (SELECT close_price FROM market_data 
-             WHERE symbol=c.symbol AND interval_minutes=c.interval_minutes 
-             ORDER BY open_time_ms DESC LIMIT 1) AS latest_price
+            (SELECT close_price FROM market_data m
+             WHERE m.symbol=c.symbol AND m.interval_minutes=%s 
+             ORDER BY m.open_time_ms DESC LIMIT 1) AS latest_price
         FROM market_data_cache c
         WHERE c.interval_minutes=%s AND c.feature_version=%s
         GROUP BY c.symbol
         """,
-        (int(settings.interval_minutes), int(settings.feature_version)),
+        (interval_minutes, interval_minutes, feature_version),
     )
     now_ms = int(time.time() * 1000)
     data_lag: List[Dict[str, Any]] = []
