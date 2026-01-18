@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Callable, Dict, List, Optional, Set
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from shared.domain.time import now_ms
 from shared.exchange.types import Kline
@@ -48,6 +49,9 @@ class KlineWebSocketService:
         
         # 订阅管理
         self.subscribed_topics: Set[str] = set()
+        
+        # 同步状态跟踪
+        self.sync_status: Dict[str, Dict[str, Any]] = defaultdict(dict)
         
     def _get_ws_client(self):
         """获取对应交易所的 WebSocket 客户端"""
@@ -232,6 +236,11 @@ class KlineWebSocketService:
                     volume=float(k.get("v", 0)),
                 )
             
+            # 更新同步状态
+            with self._lock:
+                self.sync_status[symbol]["kline_last_update"] = now_ms()
+                self.sync_status[symbol]["kline_ok"] = True
+            
             # 调用回调保存到数据库
             if self.kline_callback:
                 try:
@@ -239,6 +248,7 @@ class KlineWebSocketService:
                     _logger.debug(f"[{self.service_name}] Kline saved: {symbol} open_time_ms={kline.open_time_ms}")
                 except Exception as e:
                     _logger.error(f"[{self.service_name}] Error in kline callback: {e}", exc_info=True)
+                    # 回调失败时，状态仍然标记为 OK（数据已接收）
             
         except Exception as e:
             _logger.error(f"[{self.service_name}] Error processing kline: {e}", exc_info=True)
@@ -277,6 +287,11 @@ class KlineWebSocketService:
         if self.ws_client:
             await self.ws_client.stop()
         _logger.info(f"[{self.service_name}] Kline WebSocket service stopped")
+    
+    def get_sync_status(self, symbol: str) -> Dict[str, Any]:
+        """获取同步状态"""
+        with self._lock:
+            return self.sync_status.get(symbol, {}).copy()
     
     def is_connected(self) -> bool:
         """检查 WebSocket 是否连接"""

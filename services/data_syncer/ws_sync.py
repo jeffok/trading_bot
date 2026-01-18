@@ -143,6 +143,8 @@ class WebSocketSyncManager:
         status = {}
         if self.kline_service:
             # K线服务状态
+            kline_status = self.kline_service.get_sync_status(symbol)
+            status.update(kline_status)
             status["kline_connected"] = self.kline_service.is_connected()
         if self.price_service:
             # 价格服务状态
