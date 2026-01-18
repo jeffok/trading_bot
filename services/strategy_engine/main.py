@@ -644,9 +644,9 @@ def _ensure_protective_stop(
     # compute stop_price if missing
     if meta.get("stop_price") is None:
         try:
-            stop_dist_pct = float(meta.get("stop_dist_pct") or settings.hard_stop_loss_pct)
+            stop_dist_pct = float(meta.get("stop_dist_pct") or runtime_cfg.hard_stop_loss_pct)
         except Exception:
-            stop_dist_pct = float(settings.hard_stop_loss_pct)
+            stop_dist_pct = float(runtime_cfg.hard_stop_loss_pct)
         meta["stop_dist_pct"] = float(stop_dist_pct)
         if avg_entry is not None:
             meta["stop_price"] = float(avg_entry) * (1.0 - float(stop_dist_pct))
@@ -881,7 +881,7 @@ def _vectorize_for_ai(latest: dict) -> tuple[list[float], dict]:
     return x, bundle
 
 
-def _load_ai_model(db: PostgreSQL, settings: Settings):
+def _load_ai_model(db: PostgreSQL, settings: Settings, runtime_cfg: RuntimeConfig = None):
     """加载 AI 模型（支持 online_lr / sgd_compat）。"""
     dim = 12
     impl = (settings.ai_model_impl or 'online_lr').strip().lower()
@@ -910,9 +910,15 @@ def _load_ai_model(db: PostgreSQL, settings: Settings):
         except Exception:
             pass
 
+    # Use runtime_cfg (must be provided). ai_l2 still from .env (not migrated yet)
+    if runtime_cfg is None:
+        raise ValueError("_load_ai_model requires runtime_cfg")
+    ai_lr = float(runtime_cfg.ai_lr)
+    ai_l2 = float(settings.ai_l2)  # ai_l2 still from .env
+    
     if impl == "sgd_compat":
-        return SGDClassifierCompat(dim=dim, lr=float(settings.ai_lr), l2=float(settings.ai_l2))
-    return OnlineLogisticRegression(dim=dim, lr=float(settings.ai_lr), l2=float(settings.ai_l2))
+        return SGDClassifierCompat(dim=dim, lr=ai_lr, l2=ai_l2)
+    return OnlineLogisticRegression(dim=dim, lr=ai_lr, l2=ai_l2)
 
 
 def _maybe_persist_ai_model(db: PostgreSQL, settings: Settings, model, *, trace_id: str, force: bool = False) -> None:
@@ -1069,6 +1075,7 @@ def _close_trade_and_train(
     close_reason_code: str,
     close_reason: str,
     trace_id: str,
+    runtime_cfg=None,
 ) -> None:
     now_ms_i = int(time.time() * 1000)
     row = db.fetch_one("SELECT entry_price, entry_time_ms, features_json FROM trade_logs WHERE id=%s", (int(trade_id),))
@@ -1106,7 +1113,11 @@ def _close_trade_and_train(
         dur = max(0.0, (now_ms_i - int(row["entry_time_ms"])) / 1000.0)
         metrics.trade_last_duration_seconds.labels(SERVICE, symbol).set(dur)
 
-    if settings.ai_enabled and model is not None and label is not None and row and row.get("features_json"):
+    # runtime_cfg must be provided (no .env fallback)
+    if runtime_cfg is None:
+        raise ValueError("_close_trade_and_train requires runtime_cfg")
+    ai_enabled = runtime_cfg.ai_enabled
+    if ai_enabled and model is not None and label is not None and row and row.get("features_json"):
         try:
             fj = _parse_json_maybe(row["features_json"])
             x = fj.get("x") or []
@@ -1124,6 +1135,7 @@ def setup_b_decision(
     *,
     ai_score: float,
     settings: Settings,
+    runtime_cfg=None,
 ) -> tuple[bool, ReasonCode, str]:
     """V8.3 Setup B decision.
 
@@ -1155,9 +1167,15 @@ def setup_b_decision(
     mom_prev = _fnum(fp, "mom10")
     sq_prev = _fnum(fp, "squeeze_status")
 
-    adx_min = float(getattr(settings, "setup_b_adx_min", 20))
-    vol_min = float(getattr(settings, "setup_b_vol_ratio_min", 1.5))
-    ai_min = float(getattr(settings, "setup_b_ai_score_min", 55))
+    # 优先使用 runtime_cfg（数据库配置），否则使用 settings（.env 配置）
+    if runtime_cfg:
+        adx_min = float(runtime_cfg.setup_b_adx_min)
+        vol_min = float(runtime_cfg.setup_b_vol_ratio_min)
+        ai_min = float(runtime_cfg.setup_b_ai_score_min)
+    else:
+        adx_min = float(getattr(settings, "setup_b_adx_min", 20))
+        vol_min = float(getattr(settings, "setup_b_vol_ratio_min", 1.5))
+        ai_min = float(getattr(settings, "setup_b_ai_score_min", 55))
 
     squeeze_release = (sq_prev == 1.0 and sq == 0.0)
     mom_flip_pos = (mom_prev is not None and mom is not None and mom_prev < 0.0 and mom > 0.0)
@@ -1294,8 +1312,8 @@ class CircuitBreaker:
         return False, ""
 
 
-def get_equity_usdt(exchange: ExchangeClient, settings: Settings) -> float:
-    # Best-effort: use exchange capability; else env/config fallback.
+def get_equity_usdt(exchange: ExchangeClient, settings: Settings, runtime_cfg=None) -> float:
+    # Best-effort: use exchange capability; else runtime_cfg/config fallback.
     if hasattr(exchange, "get_equity_usdt"):
         try:
             v = exchange.get_equity_usdt()
@@ -1303,6 +1321,8 @@ def get_equity_usdt(exchange: ExchangeClient, settings: Settings) -> float:
         except Exception:
             pass
     try:
+        if runtime_cfg:
+            return float(runtime_cfg.account_equity_usdt)
         return float(getattr(settings, "account_equity_usdt", 0.0) or 0.0)
     except Exception:
         return 0.0
@@ -1323,6 +1343,7 @@ def enforce_risk_budget(
     leverage: int,
     stop_dist_pct: float,
     settings: Settings,
+    runtime_cfg=None,
 ) -> tuple[bool, int, str]:
     """Hard risk budget (V8.3).
 
@@ -1330,7 +1351,8 @@ def enforce_risk_budget(
     must be <= equity * risk_budget_pct.
     If exceeded -> reduce leverage down to 1; still exceeded -> reject.
     """
-    budget = float(equity_usdt) * float(getattr(settings, "risk_budget_pct", 0.03))
+    risk_budget_pct = float(runtime_cfg.risk_budget_pct) if runtime_cfg else float(getattr(settings, "risk_budget_pct", 0.03))
+    budget = float(equity_usdt) * risk_budget_pct
     lev = int(leverage)
     stop_pct = max(0.0, float(stop_dist_pct))
     if budget <= 0:
@@ -1596,7 +1618,7 @@ def main():
                                         db,
                                         settings,
                                         metrics,
-                                        _load_ai_model(db, settings) if settings.ai_enabled else None,
+                                        _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
                                         trade_id=trade_id2,
                                         symbol=sym,
                                         qty=float(base_qty),
@@ -1605,6 +1627,7 @@ def main():
                                         close_reason_code=ReasonCode.STOP_LOSS.value,
                                         close_reason="Protective stop filled (exchange)",
                                         trace_id=poll_trace_id,
+                                        runtime_cfg=runtime_cfg,
                                     )
                                 summary_kv = build_trade_summary(
                                     event="PROTECTIVE_STOP_FILLED",
@@ -1676,11 +1699,11 @@ def main():
             selected_open_symbols: set[str] = set()
             selected_open_meta: dict[str, dict] = {}
             try:
-                max_pos = int(settings.max_concurrent_positions)
+                max_pos = int(runtime_cfg.max_concurrent_positions)
                 available_slots = max(0, max_pos - open_cnt)
                 if available_slots > 0:
                     candidates = []  # (combined_score, symbol, meta)
-                    ai_model = _load_ai_model(db, settings) if settings.ai_enabled else None
+                    ai_model = _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None
                     for s in symbols:
                         if _budget_exceeded():
                             log_action(logger, "TICK_TIME_BUDGET_EXCEEDED", trace_id=trace_id, reason_code=ReasonCode.TICK_TIMEOUT.value, reason=f"tick budget exceeded during selection (>{settings.tick_budget_seconds}s)")
@@ -1700,12 +1723,12 @@ def main():
                             continue
                         score_s = compute_robot_score(latest_s, signal="BUY")
                         lev_s = leverage_from_score(settings, score_s)
-                        qty_s = min_qty_from_min_margin_usdt(settings.min_order_usdt, last_px, lev_s, precision=6)
+                        qty_s = min_qty_from_min_margin_usdt(runtime_cfg.min_order_usdt, last_px, lev_s, precision=6)
                         if qty_s <= 0:
                             continue
                         ai_prob = None
                         feat_bundle = {}
-                        if settings.ai_enabled and ai_model is not None:
+                        if runtime_cfg.ai_enabled and ai_model is not None:
                             try:
                                 x, feat_bundle = _vectorize_for_ai(latest_s)
                                 ai_prob = float(ai_model.predict_proba(x))
@@ -1714,7 +1737,7 @@ def main():
                                 ai_prob = None
                         combined = float(score_s)
                         if ai_prob is not None:
-                            w = _clamp(float(settings.ai_weight), 0.0, 1.0)
+                            w = _clamp(float(runtime_cfg.ai_weight), 0.0, 1.0)
                             combined = (1.0 - w) * float(score_s) + w * (ai_prob * 100.0)
                         # V8.3 Setup B: decision must include AI score + prev bar for squeeze/mom flip
                         ai_score_s = float(ai_prob * 100.0) if ai_prob is not None else 50.0
@@ -1723,6 +1746,7 @@ def main():
                             prev_s,
                             ai_score=ai_score_s,
                             settings=settings,
+                            runtime_cfg=runtime_cfg,
                         )
                         if not should_buy_s:
                             continue
@@ -1833,7 +1857,7 @@ def main():
                                     db,
                                     settings,
                                     metrics,
-                                    _load_ai_model(db, settings) if settings.ai_enabled else None,
+                                    _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
                                     trade_id=trade_id2,
                                     symbol=symbol,
                                     qty=float(base_qty),
@@ -1842,6 +1866,7 @@ def main():
                                     close_reason_code=ReasonCode.STOP_LOSS.value,
                                     close_reason="Protective stop filled (exchange)",
                                     trace_id=trace_id,
+                                    runtime_cfg=runtime_cfg,
                                 )
                             open_cnt = max(0, open_cnt - 1)
                             stop_p = None
@@ -1975,7 +2000,7 @@ def main():
                                     db,
                                     settings,
                                     metrics,
-                                    _load_ai_model(db, settings) if settings.ai_enabled else None,
+                                    _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
                                     trade_id=trade_id2,
                                     symbol=symbol,
                                     qty=float(base_qty),
@@ -1984,6 +2009,7 @@ def main():
                                     close_reason_code=ReasonCode.EMERGENCY_EXIT.value,
                                     close_reason="Emergency exit executed",
                                     trace_id=trace_id,
+                                    runtime_cfg=runtime_cfg,
                                 )
                             open_cnt = max(0, open_cnt - 1)
                             send_system_alert(
@@ -2018,7 +2044,7 @@ def main():
                     # --- 硬止损（逐仓合约） ---
                     if base_qty > 0 and avg_entry is not None:
                         meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
-                        stop_dist_pct = float(meta.get('stop_dist_pct') or settings.hard_stop_loss_pct)
+                        stop_dist_pct = float(meta.get('stop_dist_pct') or runtime_cfg.hard_stop_loss_pct)
                         stop_price = float(meta.get('stop_price') or (avg_entry * (1.0 - stop_dist_pct)))
                         if last_price <= stop_price and not (runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get('stop_client_order_id')):
                             client_order_id = make_client_order_id(
@@ -2052,7 +2078,7 @@ def main():
                                     db,
                                     settings,
                                     metrics,
-                                    _load_ai_model(db, settings) if settings.ai_enabled else None,
+                                    _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
                                     trade_id=trade_id2,
                                     symbol=symbol,
                                     qty=float(base_qty),
@@ -2061,6 +2087,7 @@ def main():
                                     close_reason_code=ReasonCode.STOP_LOSS.value,
                                     close_reason="Hard stop loss triggered",
                                     trace_id=trace_id,
+                                    runtime_cfg=runtime_cfg,
                                 )
                             open_cnt = max(0, open_cnt - 1)
                             summary_kv = build_trade_summary(
@@ -2115,8 +2142,8 @@ def main():
                         # 多币对选币开仓：仅允许本轮被 AI 选中的币对执行开仓
                         if symbol not in selected_open_symbols:
                             continue
-                        # 全局最多 3 单（跨交易对）
-                        if open_cnt >= int(settings.max_concurrent_positions):
+                        # 全局最多 N 单（跨交易对）
+                        if open_cnt >= int(runtime_cfg.max_concurrent_positions):
                             continue
 
                         # 动态杠杆：10~20 倍（由机器人评分决定）
@@ -2127,15 +2154,16 @@ def main():
                         feat_bundle = meta_open.get("features_bundle") or {}
                         lev = leverage_from_score(settings, score)
                         # V8.3 risk budget hard-constraint
-                        equity_usdt = get_equity_usdt(ex, settings)
+                        equity_usdt = get_equity_usdt(ex, settings, runtime_cfg)
                         ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
                         base_margin_usdt = compute_base_margin_usdt(equity_usdt=equity_usdt, ai_score=ai_score, settings=settings)
                         ok_risk, lev2, risk_note = enforce_risk_budget(
                             equity_usdt=equity_usdt,
                             base_margin_usdt=base_margin_usdt,
                             leverage=int(lev),
-                            stop_dist_pct=float(settings.hard_stop_loss_pct),
+                            stop_dist_pct=float(runtime_cfg.hard_stop_loss_pct),
                             settings=settings,
+                            runtime_cfg=runtime_cfg,
                         )
                         if not ok_risk:
                             append_order_event(
@@ -2153,7 +2181,7 @@ def main():
                                 status="REJECTED",
                                 reason_code=ReasonCode.RISK_BUDGET_REJECT.value,
                                 reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(settings.hard_stop_loss_pct), "ai_score": ai_score},
+                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
                             )
 
                         log_action(logger, "RISK_BUDGET_REJECT", trace_id=trace_id, symbol=symbol,
@@ -2192,7 +2220,7 @@ def main():
                                 status="ADJUST",
                                 reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value,
                                 reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(settings.hard_stop_loss_pct), "ai_score": ai_score},
+                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
                             )
 
                         log_action(logger, "RISK_BUDGET_ADJUST", trace_id=trace_id, symbol=symbol,
@@ -2204,7 +2232,7 @@ def main():
                         # 你要求的口径：MIN_ORDER_USDT 是“实际保证金(USDT)”，而不是名义仓位。
                         # 名义价值(notional) ≈ 价格 * qty ≈ 保证金 * 杠杆。
                         # 因此最小下单 qty 需要按 notional_min = min_margin * leverage 反推。
-                        qty = min_qty_from_min_margin_usdt(settings.min_order_usdt, last_price, lev, precision=6)
+                        qty = min_qty_from_min_margin_usdt(runtime_cfg.min_order_usdt, last_price, lev, precision=6)
                         if qty <= 0:
                             continue
 
@@ -2227,6 +2255,7 @@ def main():
                             prev,
                             ai_score=ai_score,
                             settings=settings,
+                            runtime_cfg=runtime_cfg,
                         )
                         if not should_buy:
                             # 记录为什么没有下单（仅在DEBUG级别或定期记录，避免日志过多）
@@ -2242,7 +2271,7 @@ def main():
                             )
                             continue
 
-                        stop_dist_pct = float(settings.hard_stop_loss_pct)
+                        stop_dist_pct = float(runtime_cfg.hard_stop_loss_pct)
 
                         stop_price_init = float(last_price) * (1.0 - stop_dist_pct)
                         open_reason = f"Setup B BUY; robot={round(float(score),2)}; ai_prob={round(float(ai_prob),4) if ai_prob is not None else None}; combined={round(float(combined_score),2)}"
@@ -2280,8 +2309,8 @@ def main():
                                 "stop_dist_pct": stop_dist_pct,
                                 "stop_price": stop_price_init,
                                 "leverage": lev,
-                                "min_margin_usdt": settings.min_order_usdt,
-                                "notional_min_usdt": round(float(settings.min_order_usdt) * float(lev), 4),
+                                "min_margin_usdt": runtime_cfg.min_order_usdt,
+                                "notional_min_usdt": round(float(runtime_cfg.min_order_usdt) * float(lev), 4),
                                 "qty": qty,
                                 "last_price": last_price,
                             }
@@ -2439,15 +2468,16 @@ def main():
                         score = compute_robot_score(latest, signal="SELL")
                         lev = leverage_from_score(settings, score)
                         # V8.3 risk budget hard-constraint
-                        equity_usdt = get_equity_usdt(ex, settings)
+                        equity_usdt = get_equity_usdt(ex, settings, runtime_cfg)
                         ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
                         base_margin_usdt = compute_base_margin_usdt(equity_usdt=equity_usdt, ai_score=ai_score, settings=settings)
                         ok_risk, lev2, risk_note = enforce_risk_budget(
                             equity_usdt=equity_usdt,
                             base_margin_usdt=base_margin_usdt,
                             leverage=int(lev),
-                            stop_dist_pct=float(settings.hard_stop_loss_pct),
+                            stop_dist_pct=float(runtime_cfg.hard_stop_loss_pct),
                             settings=settings,
+                            runtime_cfg=runtime_cfg,
                         )
                         if not ok_risk:
                             append_order_event(
@@ -2465,7 +2495,7 @@ def main():
                                 status="REJECTED",
                                 reason_code=ReasonCode.RISK_BUDGET_REJECT.value,
                                 reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(settings.hard_stop_loss_pct), "ai_score": ai_score},
+                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
                             )
 
                         log_action(logger, "RISK_BUDGET_REJECT", trace_id=trace_id, symbol=symbol,
@@ -2504,7 +2534,7 @@ def main():
                                 status="ADJUST",
                                 reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value,
                                 reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(settings.hard_stop_loss_pct), "ai_score": ai_score},
+                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
                             )
 
                         log_action(logger, "RISK_BUDGET_ADJUST", trace_id=trace_id, symbol=symbol,
@@ -2578,7 +2608,7 @@ def main():
                                 db,
                                 settings,
                                 metrics,
-                                _load_ai_model(db, settings) if settings.ai_enabled else None,
+                                _load_ai_model(db, settings) if runtime_cfg.ai_enabled else None,
                                 trade_id=trade_id2,
                                 symbol=symbol,
                                 qty=float(qty),
@@ -2587,6 +2617,7 @@ def main():
                                 close_reason_code=close_code,
                                 close_reason="Setup B SELL",
                                 trace_id=trace_id,
+                                runtime_cfg=runtime_cfg,
                             )
                         open_cnt = max(0, open_cnt - 1)
 

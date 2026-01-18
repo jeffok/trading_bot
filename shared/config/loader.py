@@ -103,26 +103,17 @@ class Settings:
 
     interval_minutes: int = int(os.getenv("INTERVAL_MINUTES", "15"))
     strategy_tick_seconds: int = int(os.getenv("STRATEGY_TICK_SECONDS", "900"))
-    hard_stop_loss_pct: float = float(os.getenv("HARD_STOP_LOSS_PCT", "0.03"))
-
-    # Setup B (V8.3)
-    setup_b_adx_min: float = float(os.getenv("SETUP_B_ADX_MIN", "20"))
-    setup_b_vol_ratio_min: float = float(os.getenv("SETUP_B_VOL_RATIO_MIN", "1.5"))
-    setup_b_ai_score_min: float = float(os.getenv("SETUP_B_AI_SCORE_MIN", "55"))
+    # 注意：hard_stop_loss_pct、setup_b_*、risk_budget_* 等参数已迁移到数据库配置
+    # 请使用 Web UI (/admin/ui) 或 API (/admin/update_config) 进行配置
 
     # Risk budget / circuit breaker (V8.3)
-    account_equity_usdt: float = float(os.getenv("ACCOUNT_EQUITY_USDT", "500"))
-    risk_budget_pct: float = float(os.getenv("RISK_BUDGET_PCT", "0.03"))
-    max_drawdown_pct: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.15"))
     circuit_window_seconds: int = int(os.getenv("CIRCUIT_WINDOW_SECONDS", "600"))
     circuit_rate_limit_threshold: int = int(os.getenv("CIRCUIT_RATE_LIMIT_THRESHOLD", "8"))
     circuit_failure_threshold: int = int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", "6"))
     btc_symbol: str = os.getenv("BTC_SYMBOL", "BTCUSDT").upper()
 
     # 交易与风控（MVP 默认）
-    max_concurrent_positions: int = int(os.getenv('MAX_CONCURRENT_POSITIONS', '3'))
-    # 每单最小保证金（USDT）- 由策略侧反推 qty；名义价值通常为保证金*杠杆
-    min_order_usdt: float = float(os.getenv('MIN_ORDER_USDT', '50'))
+    # 注意：max_concurrent_positions、min_order_usdt 已迁移到数据库配置
     # 根据评分自动选择杠杆范围
     auto_leverage_min: int = int(os.getenv('AUTO_LEVERAGE_MIN', '10'))
     auto_leverage_max: int = int(os.getenv('AUTO_LEVERAGE_MAX', '20'))
@@ -131,11 +122,9 @@ class Settings:
     take_profit_reason_on_positive_pnl: bool = os.getenv("TAKE_PROFIT_REASON_ON_POSITIVE_PNL", "true").strip().lower() in ("1","true","yes","y")
 
     # AI (online learning)
-    ai_enabled: bool = os.getenv("AI_ENABLED", "true").strip().lower() in ("1","true","yes","y")
-    ai_weight: float = float(os.getenv("AI_WEIGHT", "0.35"))  # 0..1
-    ai_lr: float = float(os.getenv("AI_LR", "0.05"))
-    ai_l2: float = float(os.getenv("AI_L2", "0.000001"))
-    ai_min_samples: int = int(os.getenv("AI_MIN_SAMPLES", "50"))
+    # 注意：ai_enabled、ai_weight、ai_lr、ai_min_samples 已迁移到数据库配置
+    # 使用 Web UI (/admin/ui) 或 API (/admin/update_config) 进行配置
+    ai_l2: float = float(os.getenv("AI_L2", "0.000001"))  # 仍从 .env 读取（暂未迁移）
     ai_model_key: str = os.getenv("AI_MODEL_KEY", "AI_MODEL_V1")
     ai_model_impl: str = os.getenv("AI_MODEL_IMPL", "online_lr").strip().lower()  # online_lr | sgd_compat
 

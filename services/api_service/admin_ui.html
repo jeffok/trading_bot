@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交易机器人管理界面</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .header h1 { color: #2563eb; margin-bottom: 10px; }
+        .header .status { color: #666; font-size: 14px; }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-size: 16px;
+            color: #666;
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s;
+        }
+        .tab.active {
+            color: #2563eb;
+            border-bottom-color: #2563eb;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .card h2 {
+            margin-bottom: 15px;
+            color: #1f2937;
+            font-size: 18px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #374151;
+        }
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .form-group textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+        .form-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: #2563eb;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #1d4ed8;
+        }
+        .btn-danger {
+            background: #dc2626;
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #b91c1c;
+        }
+        .btn-success {
+            background: #16a34a;
+            color: white;
+        }
+        .btn-success:hover {
+            background: #15803d;
+        }
+        .alert {
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+        .alert-success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #6ee7b7;
+        }
+        .alert-error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fca5a5;
+        }
+        .config-list {
+            display: grid;
+            gap: 10px;
+        }
+        .config-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            background: #f9fafb;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        .config-item .key {
+            font-weight: 500;
+            color: #1f2937;
+        }
+        .config-item .value {
+            color: #6b7280;
+            font-family: monospace;
+        }
+        .config-item .actions {
+            display: flex;
+            gap: 8px;
+        }
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+        }
+        @media (max-width: 768px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 交易机器人管理界面</h1>
+            <div class="status" id="status">加载中...</div>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('status')">系统状态</button>
+            <button class="tab" onclick="switchTab('config')">配置管理</button>
+            <button class="tab" onclick="switchTab('control')">控制操作</button>
+        </div>
+
+        <!-- 系统状态 -->
+        <div id="status-tab" class="tab-content active">
+            <div class="card">
+                <h2>系统信息</h2>
+                <div id="status-info" class="loading">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 配置管理 -->
+        <div id="config-tab" class="tab-content">
+            <div class="card">
+                <h2>更新配置</h2>
+                <div id="config-alert"></div>
+                <form id="config-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>配置键 (KEY)</label>
+                            <input type="text" id="config-key" placeholder="例如: SETUP_B_ADX_MIN" required>
+                        </div>
+                        <div class="form-group">
+                            <label>配置值 (VALUE)</label>
+                            <input type="text" id="config-value" placeholder="例如: 22" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>操作者</label>
+                        <input type="text" id="config-actor" placeholder="例如: admin" required>
+                    </div>
+                    <div class="form-group">
+                        <label>原因说明</label>
+                        <textarea id="config-reason" placeholder="说明为什么要修改此配置" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">更新配置</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <h2>当前配置列表</h2>
+                <div id="config-list" class="loading">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 控制操作 -->
+        <div id="control-tab" class="tab-content">
+            <div class="card">
+                <h2>系统控制</h2>
+                <div id="control-alert"></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>操作者</label>
+                        <input type="text" id="control-actor" placeholder="例如: admin" required>
+                    </div>
+                    <div class="form-group">
+                        <label>原因说明</label>
+                        <input type="text" id="control-reason" placeholder="说明操作原因" required>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 15px;">
+                    <button class="btn btn-danger" onclick="controlAction('halt')">暂停交易</button>
+                    <button class="btn btn-success" onclick="controlAction('resume')">恢复交易</button>
+                    <button class="btn btn-danger" onclick="controlAction('emergency_exit')">紧急退出</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let adminToken = '';
+
+        // 从URL或localStorage获取token
+        function getToken() {
+            const params = new URLSearchParams(window.location.search);
+            const token = params.get('token') || localStorage.getItem('admin_token') || prompt('请输入管理员Token:');
+            if (token) {
+                localStorage.setItem('admin_token', token);
+                adminToken = token;
+            }
+            return token;
+        }
+
+        // API请求封装
+        async function apiCall(method, endpoint, data = null) {
+            const options = {
+                method,
+                headers: {
+                    'Authorization': `Bearer ${adminToken}`,
+                    'Content-Type': 'application/json'
+                }
+            };
+            if (data) options.body = JSON.stringify(data);
+
+            const res = await fetch(`${API_BASE}${endpoint}`, options);
+            if (res.status === 401 || res.status === 403) {
+                localStorage.removeItem('admin_token');
+                alert('认证失败，请重新输入Token');
+                window.location.reload();
+                return null;
+            }
+            return res.json();
+        }
+
+        // 加载系统状态
+        async function loadStatus() {
+            const status = await apiCall('GET', '/admin/status');
+            if (!status) return;
+
+            const statusHtml = `
+                <div class="form-row">
+                    <div><strong>交易所:</strong> ${status.config.EXCHANGE}</div>
+                    <div><strong>交易对:</strong> ${status.config.EFFECTIVE_SYMBOLS.join(', ')}</div>
+                    <div><strong>暂停交易:</strong> ${status.config.HALT_TRADING ? '是' : '否'}</div>
+                    <div><strong>紧急退出:</strong> ${status.config.EMERGENCY_EXIT ? '是' : '否'}</div>
+                    <div><strong>持仓数:</strong> ${status.open_positions}</div>
+                    <div><strong>服务数:</strong> ${Object.keys(status.services).length}</div>
+                </div>
+            `;
+            document.getElementById('status-info').innerHTML = statusHtml;
+            document.getElementById('status').textContent = `最后更新: ${new Date().toLocaleString('zh-CN')}`;
+        }
+
+        // 加载配置列表
+        async function loadConfigs() {
+            const status = await apiCall('GET', '/admin/status');
+            if (!status) return;
+
+            const configs = status.config;
+            const configList = Object.entries(configs).map(([key, value]) => `
+                <div class="config-item">
+                    <div>
+                        <div class="key">${key}</div>
+                        <div class="value">${JSON.stringify(value)}</div>
+                    </div>
+                </div>
+            `).join('');
+            document.getElementById('config-list').innerHTML = configList || '<div>暂无配置</div>';
+        }
+
+        // 更新配置
+        document.getElementById('config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const key = document.getElementById('config-key').value;
+            const value = document.getElementById('config-value').value;
+            const actor = document.getElementById('config-actor').value;
+            const reason = document.getElementById('config-reason').value;
+
+            const result = await apiCall('POST', '/admin/update_config', {
+                key,
+                value,
+                actor,
+                reason_code: 'ADMIN_UPDATE_CONFIG',
+                reason
+            });
+
+            if (result && result.ok) {
+                showAlert('config-alert', '配置更新成功！', 'success');
+                document.getElementById('config-form').reset();
+                setTimeout(loadConfigs, 1000);
+            } else {
+                showAlert('config-alert', '配置更新失败，请检查输入', 'error');
+            }
+        });
+
+        // 控制操作
+        async function controlAction(action) {
+            const actor = document.getElementById('control-actor').value;
+            const reason = document.getElementById('control-reason').value;
+
+            if (!actor || !reason) {
+                showAlert('control-alert', '请填写操作者和原因', 'error');
+                return;
+            }
+
+            const reasonCode = {
+                'halt': 'ADMIN_HALT',
+                'resume': 'ADMIN_RESUME',
+                'emergency_exit': 'EMERGENCY_EXIT'
+            }[action];
+
+            const result = await apiCall('POST', `/admin/${action}`, {
+                actor,
+                reason_code: reasonCode,
+                reason
+            });
+
+            if (result && result.ok) {
+                showAlert('control-alert', '操作成功！', 'success');
+                setTimeout(loadStatus, 1000);
+            } else {
+                showAlert('control-alert', '操作失败', 'error');
+            }
+        }
+
+        // 显示提示
+        function showAlert(elementId, message, type) {
+            const alert = document.getElementById(elementId);
+            alert.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+            setTimeout(() => alert.innerHTML = '', 5000);
+        }
+
+        // 切换标签
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(`${tab}-tab`).classList.add('active');
+
+            if (tab === 'status') loadStatus();
+            if (tab === 'config') { loadConfigs(); loadStatus(); }
+        }
+
+        // 初始化
+        (async () => {
+            if (!getToken()) {
+                alert('需要管理员Token才能访问');
+                return;
+            }
+            await loadStatus();
+            await loadConfigs();
+            setInterval(loadStatus, 30000); // 每30秒刷新状态
+        })();
+    </script>
+</body>
+</html>

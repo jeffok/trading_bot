@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse, HTMLResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -397,6 +397,15 @@ def health(settings: Settings = Depends(get_settings), db: PostgreSQL = Depends(
 def metrics() -> PlainTextResponse:
     data = generate_latest()
     return PlainTextResponse(content=data.decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/admin/ui", response_class=HTMLResponse)
+def admin_ui() -> HTMLResponse:
+    """Web管理界面"""
+    ui_file = Path(__file__).parent / "admin_ui.html"
+    if not ui_file.exists():
+        return HTMLResponse(content="<h1>管理界面文件未找到</h1>", status_code=404)
+    return FileResponse(ui_file)
 
 
 def write_system_config(
