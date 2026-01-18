@@ -201,6 +201,51 @@
             color: #374151;
             margin-bottom: 5px;
         }
+        .service-status {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .service-card {
+            padding: 15px;
+            background: #f9fafb;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+        }
+        .service-card h3 {
+            margin-bottom: 10px;
+            color: #1f2937;
+            font-size: 16px;
+        }
+        .service-card .status-line {
+            margin: 5px 0;
+            font-size: 14px;
+            color: #6b7280;
+        }
+        .config-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        .config-table th,
+        .config-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .config-table th {
+            background: #f9fafb;
+            font-weight: 500;
+            color: #374151;
+            width: 40%;
+        }
+        .config-table td {
+            color: #6b7280;
+        }
+        .config-table tr:hover {
+            background: #f9fafb;
+        }
         .btn-sm {
             padding: 6px 12px;
             font-size: 12px;
@@ -296,10 +341,9 @@
                     <div class="form-group">
                         <label>配置值 (VALUE)</label>
                         <input type="text" id="config-value" placeholder="请输入配置值" required>
-                    </div>
-                    <div class="form-group">
-                        <label>操作者</label>
-                        <input type="text" id="config-actor" placeholder="例如: admin" required>
+                        <div id="config-current-value" style="margin-top: 5px; font-size: 13px; color: #6b7280; display: none;">
+                            <strong>当前值：</strong><span id="config-current-value-text"></span>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label>原因说明</label>
@@ -320,15 +364,9 @@
             <div class="card">
                 <h2>系统控制</h2>
                 <div id="control-alert"></div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>操作者</label>
-                        <input type="text" id="control-actor" placeholder="例如: admin" required>
-                    </div>
-                    <div class="form-group">
-                        <label>原因说明</label>
-                        <input type="text" id="control-reason" placeholder="说明操作原因" required>
-                    </div>
+                <div class="form-group">
+                    <label>原因说明</label>
+                    <input type="text" id="control-reason" placeholder="说明操作原因" required>
                 </div>
                 <div style="display: flex; gap: 10px; margin-top: 15px;">
                     <button class="btn btn-danger" onclick="controlAction('halt')">暂停交易</button>
@@ -385,6 +423,28 @@
                 ? `<div class="symbols-display">${symbols.map(s => `<span class="symbol-tag">${s}</span>`).join('')}</div>`
                 : '<span style="color: #9ca3af;">暂无交易对</span>';
 
+            // 服务状态
+            const services = status.services || {};
+            const serviceNames = ['api-service', 'data-syncer', 'strategy-engine'];
+            const servicesHtml = serviceNames.map(name => {
+                const service = services[name];
+                const lastHeartbeat = service ? new Date(service.last_heartbeat).toLocaleString('zh-CN') : '无数据';
+                const statusInfo = service && service.status ? service.status : {};
+                const role = statusInfo.role || '未知';
+                const leader = statusInfo.leader || '未知';
+                const isRunning = service && (Date.now() - new Date(service.last_heartbeat).getTime() < 120000); // 2分钟内
+                
+                return `
+                    <div class="service-card">
+                        <h3>${name}</h3>
+                        <div class="status-line"><strong>状态:</strong> <span style="color: ${isRunning ? '#16a34a' : '#dc2626'}">${isRunning ? '运行中' : '离线'}</span></div>
+                        <div class="status-line"><strong>角色:</strong> ${role}</div>
+                        <div class="status-line"><strong>实例ID:</strong> ${service ? service.instance_id : 'N/A'}</div>
+                        <div class="status-line"><strong>最后心跳:</strong> ${lastHeartbeat}</div>
+                    </div>
+                `;
+            }).join('');
+
             const statusHtml = `
                 <div class="status-item">
                     <div class="status-item-label">交易所</div>
@@ -398,20 +458,29 @@
                     <div><strong>暂停交易:</strong> <span style="color: ${status.config.HALT_TRADING ? '#dc2626' : '#16a34a'}">${status.config.HALT_TRADING ? '是' : '否'}</span></div>
                     <div><strong>紧急退出:</strong> <span style="color: ${status.config.EMERGENCY_EXIT ? '#dc2626' : '#16a34a'}">${status.config.EMERGENCY_EXIT ? '是' : '否'}</span></div>
                     <div><strong>持仓数:</strong> ${status.open_positions || 0}</div>
-                    <div><strong>服务数:</strong> ${Object.keys(status.services || {}).length}</div>
+                </div>
+                <div class="service-status">
+                    <h2 style="grid-column: 1 / -1; margin-bottom: 10px;">服务状态</h2>
+                    ${servicesHtml}
                 </div>
             `;
             document.getElementById('status-info').innerHTML = statusHtml;
             document.getElementById('status').textContent = `最后更新: ${new Date().toLocaleString('zh-CN')}`;
         }
 
+        // 当前配置数据（用于显示当前值）
+        let currentConfigs = {};
+
         // 加载配置列表
         async function loadConfigs() {
             const status = await apiCall('GET', '/admin/status');
             if (!status) return;
 
-            const configs = status.config;
-            const configList = Object.entries(configs).map(([key, value]) => {
+            const configs = status.config || {};
+            currentConfigs = configs; // 保存当前配置
+
+            // 生成表格行
+            const rows = Object.entries(configs).map(([key, value]) => {
                 let valueHtml = '';
                 if (Array.isArray(value) && key === 'EFFECTIVE_SYMBOLS') {
                     // 特殊处理 EFFECTIVE_SYMBOLS，显示为标签
@@ -426,16 +495,14 @@
                     // 普通值
                     valueHtml = `<span class="value">${JSON.stringify(value)}</span>`;
                 }
-                return `
-                <div class="config-item">
-                    <div>
-                        <div class="key">${key}</div>
-                        ${valueHtml}
-                    </div>
-                </div>
-            `;
+                return `<tr><td><strong>${key}</strong></td><td>${valueHtml}</td></tr>`;
             }).join('');
-            document.getElementById('config-list').innerHTML = configList || '<div>暂无配置</div>';
+
+            const configList = rows 
+                ? `<table class="config-table"><thead><tr><th>参数名</th><th>参数值</th></tr></thead><tbody>${rows}</tbody></table>`
+                : '<div style="text-align: center; padding: 20px; color: #9ca3af;">暂无配置</div>';
+            
+            document.getElementById('config-list').innerHTML = configList;
         }
 
         // 更新配置
@@ -443,13 +510,12 @@
             e.preventDefault();
             const key = document.getElementById('config-key').value;
             const value = document.getElementById('config-value').value;
-            const actor = document.getElementById('config-actor').value;
             const reason = document.getElementById('config-reason').value;
 
             const result = await apiCall('POST', '/admin/update_config', {
                 key,
                 value,
-                actor,
+                actor: 'admin', // 固定为 admin
                 reason_code: 'ADMIN_UPDATE_CONFIG',
                 reason
             });
@@ -465,11 +531,10 @@
 
         // 控制操作
         async function controlAction(action) {
-            const actor = document.getElementById('control-actor').value;
             const reason = document.getElementById('control-reason').value;
 
-            if (!actor || !reason) {
-                showAlert('control-alert', '请填写操作者和原因', 'error');
+            if (!reason) {
+                showAlert('control-alert', '请填写操作原因', 'error');
                 return;
             }
 
@@ -480,7 +545,7 @@
             }[action];
 
             const result = await apiCall('POST', `/admin/${action}`, {
-                actor,
+                actor: 'admin', // 固定为 admin
                 reason_code: reasonCode,
                 reason
             });
@@ -590,12 +655,16 @@
             const input = document.getElementById('config-key');
             const help = document.getElementById('config-key-help');
             const valueInput = document.getElementById('config-value');
+            const currentValueEl = document.getElementById('config-current-value');
+            const currentValueText = document.getElementById('config-current-value-text');
             
             if (select.value) {
                 input.value = select.value;
                 showParamHelp(select.value, help, valueInput);
+                showCurrentValue(select.value, currentValueEl, currentValueText);
             } else {
                 help.style.display = 'none';
+                currentValueEl.style.display = 'none';
             }
         }
 
@@ -605,15 +674,20 @@
             const input = document.getElementById('config-key');
             const help = document.getElementById('config-key-help');
             const valueInput = document.getElementById('config-value');
+            const currentValueEl = document.getElementById('config-current-value');
+            const currentValueText = document.getElementById('config-current-value-text');
             
             if (input.value && select.value === input.value) {
                 // 如果输入值匹配选择，保持帮助显示
                 return;
             }
-            if (input.value && PARAM_CONFIGS[input.value.toUpperCase()]) {
-                showParamHelp(input.value.toUpperCase(), help, valueInput);
+            const key = input.value.toUpperCase();
+            if (input.value && PARAM_CONFIGS[key]) {
+                showParamHelp(key, help, valueInput);
+                showCurrentValue(key, currentValueEl, currentValueText);
             } else {
                 help.style.display = 'none';
+                currentValueEl.style.display = 'none';
             }
         }
 
@@ -634,6 +708,25 @@
                 }
             } else {
                 helpEl.style.display = 'none';
+            }
+        }
+
+        // 显示当前配置值
+        function showCurrentValue(key, currentValueEl, currentValueText) {
+            const value = currentConfigs[key];
+            if (value !== undefined && value !== null) {
+                let displayValue = '';
+                if (Array.isArray(value)) {
+                    displayValue = value.join(', ');
+                } else if (typeof value === 'boolean') {
+                    displayValue = value ? 'true' : 'false';
+                } else {
+                    displayValue = String(value);
+                }
+                currentValueText.textContent = displayValue;
+                currentValueEl.style.display = 'block';
+            } else {
+                currentValueEl.style.display = 'none';
             }
         }
 

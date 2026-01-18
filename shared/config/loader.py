@@ -30,29 +30,14 @@ def _env_first(*names: str, default: str = "") -> str:
 
 
 def _parse_symbols_env() -> tuple[str, ...]:
-    """Parse SYMBOLS env (comma/space separated). Fallback to SYMBOL.
-
-    Examples:
-      SYMBOLS="BTCUSDT,ETHUSDT" -> ("BTCUSDT","ETHUSDT")
-      SYMBOL="BTCUSDT" -> ("BTCUSDT",)
+    """交易对已迁移到数据库配置，不再从 .env 读取。
+    
+    默认值：("BTCUSDT", "ETHUSDT")
+    请使用 Web UI (/admin/ui) 或 API (/admin/update_config) 配置 SYMBOLS
     """
-    raw = _env_first("SYMBOLS", default="")
-    if not raw:
-        raw = _env_first("SYMBOL", default="BTCUSDT")
-    # allow comma or whitespace separated
-    parts = []
-    for token in re.split(r"[\s,]+", raw.strip()):
-        t = token.strip().upper()
-        if t:
-            parts.append(t)
-    # de-duplicate while preserving order
-    seen = set()
-    uniq = []
-    for s in parts:
-        if s not in seen:
-            seen.add(s)
-            uniq.append(s)
-    return tuple(uniq) if uniq else ("BTCUSDT",)
+    # 不再从环境变量读取，返回默认值
+    # RuntimeConfig 会从数据库读取，如果数据库没有则使用此默认值
+    return ("BTCUSDT", "ETHUSDT")
 
 
 def _parse_csv_env(name: str, *, fallback: str = "", upper: bool = False) -> tuple[str, ...]:
@@ -97,9 +82,11 @@ class Settings:
     exchange_category: str = os.getenv("EXCHANGE_CATEGORY", "linear").lower()
     futures_leverage: int = int(os.getenv("FUTURES_LEVERAGE", "3"))
     bybit_position_idx: int = int(os.getenv("BYBIT_POSITION_IDX", "0"))
-    symbol: str = os.getenv("SYMBOL", "BTCUSDT").upper()
-    # 多交易对池（优先 SYMBOLS，其次 SYMBOL）
-    symbols: tuple[str, ...] = field(default_factory=_parse_symbols_env)
+    # 注意：symbol 和 symbols 已迁移到数据库配置（SYMBOLS），不再从 .env 读取
+    # 默认值：("BTCUSDT", "ETHUSDT")
+    # 请使用 Web UI (/admin/ui) 或 API (/admin/update_config) 进行配置
+    symbol: str = "BTCUSDT"  # 兼容字段，仅用于向后兼容
+    symbols: tuple[str, ...] = field(default_factory=lambda: ("BTCUSDT", "ETHUSDT"))
 
     interval_minutes: int = int(os.getenv("INTERVAL_MINUTES", "15"))
     strategy_tick_seconds: int = int(os.getenv("STRATEGY_TICK_SECONDS", "900"))

@@ -154,8 +154,13 @@ class RuntimeConfig:
         ),
         )
         db_symbols = _parse_symbols(m.get("SYMBOLS"))
-        # symbols 回退：优先数据库，其次 settings，最后默认空
-        symbols = db_symbols if db_symbols else (tuple(settings.symbols) if settings else tuple())
+        # symbols 回退：优先数据库，其次 settings，最后默认值 ("BTCUSDT", "ETHUSDT")
+        if db_symbols:
+            symbols = db_symbols
+        elif settings and settings.symbols:
+            symbols = tuple(settings.symbols)
+        else:
+            symbols = ("BTCUSDT", "ETHUSDT")  # 默认交易对
         symbols_from_db = bool(db_symbols)
 
         return cls(
@@ -244,8 +249,13 @@ class RuntimeConfig:
         ),
         )
         db_symbols = _parse_symbols(m.get("SYMBOLS"))
-        # symbols 回退：优先数据库，其次 settings（如果提供），最后默认空
-        self.symbols = db_symbols if db_symbols else (tuple(settings.symbols) if settings else tuple())
+        # symbols 回退：优先数据库，其次 settings，最后默认值 ("BTCUSDT", "ETHUSDT")
+        if db_symbols:
+            self.symbols = db_symbols
+        elif settings and settings.symbols:
+            self.symbols = tuple(settings.symbols)
+        else:
+            self.symbols = ("BTCUSDT", "ETHUSDT")  # 默认交易对
         self.symbols_from_db = bool(db_symbols)
         self.halt_trading = _parse_bool(m.get("HALT_TRADING"), default=False)
         self.emergency_exit = _parse_bool(m.get("EMERGENCY_EXIT"), default=False)
