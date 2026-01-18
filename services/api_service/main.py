@@ -542,6 +542,21 @@ def admin_status(
         if qty > 0:
             open_positions += 1
 
+    # 加载策略、风控、AI参数
+    setup_b_adx_min_raw = get_system_config(db, "SETUP_B_ADX_MIN", "20.0")
+    setup_b_vol_ratio_min_raw = get_system_config(db, "SETUP_B_VOL_RATIO_MIN", "1.5")
+    setup_b_ai_score_min_raw = get_system_config(db, "SETUP_B_AI_SCORE_MIN", "55.0")
+    hard_stop_loss_pct_raw = get_system_config(db, "HARD_STOP_LOSS_PCT", "0.03")
+    account_equity_usdt_raw = get_system_config(db, "ACCOUNT_EQUITY_USDT", "500.0")
+    risk_budget_pct_raw = get_system_config(db, "RISK_BUDGET_PCT", "0.03")
+    max_drawdown_pct_raw = get_system_config(db, "MAX_DRAWDOWN_PCT", "0.15")
+    max_concurrent_positions_raw = get_system_config(db, "MAX_CONCURRENT_POSITIONS", "3")
+    min_order_usdt_raw = get_system_config(db, "MIN_ORDER_USDT", "50.0")
+    ai_enabled_raw = get_system_config(db, "AI_ENABLED", "true")
+    ai_weight_raw = get_system_config(db, "AI_WEIGHT", "0.35")
+    ai_lr_raw = get_system_config(db, "AI_LR", "0.05")
+    ai_min_samples_raw = get_system_config(db, "AI_MIN_SAMPLES", "50")
+
     return {
         "ok": True,
         "trace_id": trace_id,
@@ -558,6 +573,24 @@ def admin_status(
             "STOP_ARM_BACKOFF_BASE_SECONDS": float(stop_arm_backoff_base_seconds),
             "STOP_REARM_MAX_ATTEMPTS": int(stop_rearm_max_attempts),
             "STOP_REARM_COOLDOWN_SECONDS": int(stop_rearm_cooldown_seconds),
+            # 策略参数
+            "SETUP_B_ADX_MIN": float(setup_b_adx_min_raw),
+            "SETUP_B_VOL_RATIO_MIN": float(setup_b_vol_ratio_min_raw),
+            "SETUP_B_AI_SCORE_MIN": float(setup_b_ai_score_min_raw),
+            "HARD_STOP_LOSS_PCT": float(hard_stop_loss_pct_raw),
+            # 风控参数
+            "ACCOUNT_EQUITY_USDT": float(account_equity_usdt_raw),
+            "RISK_BUDGET_PCT": float(risk_budget_pct_raw),
+            "MAX_DRAWDOWN_PCT": float(max_drawdown_pct_raw),
+            "MAX_CONCURRENT_POSITIONS": int(max_concurrent_positions_raw),
+            "MIN_ORDER_USDT": float(min_order_usdt_raw),
+            # AI参数
+            "AI_ENABLED": _parse_bool(ai_enabled_raw),
+            "AI_WEIGHT": float(ai_weight_raw),
+            "AI_LR": float(ai_lr_raw),
+            "AI_MIN_SAMPLES": int(ai_min_samples_raw),
+            # SYMBOLS（用于显示当前值）
+            "SYMBOLS": symbols_db_raw if symbols_db_raw else "",
         },
         "open_positions": open_positions,
         "positions": positions,

@@ -242,9 +242,28 @@
         }
         .config-table td {
             color: #6b7280;
+            vertical-align: top;
         }
         .config-table tr:hover {
             background: #f9fafb;
+        }
+        .config-table .value-array {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: flex-start;
+            text-align: left;
+        }
+        .config-table .value-tag {
+            display: inline-block;
+            padding: 4px 10px;
+            background: #e0e7ff;
+            color: #3730a3;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: 'Courier New', monospace;
+            font-weight: 500;
+            white-space: nowrap;
         }
         .btn-sm {
             padding: 6px 12px;
@@ -328,10 +347,16 @@
                                     <option value="AI_LR">AI_LR - AI学习率</option>
                                     <option value="AI_MIN_SAMPLES">AI_MIN_SAMPLES - AI最小样本数</option>
                                 </optgroup>
-                                <optgroup label="其他参数">
-                                    <option value="SYMBOLS">SYMBOLS - 交易对列表</option>
+                                <optgroup label="停止订单配置">
                                     <option value="USE_PROTECTIVE_STOP_ORDER">USE_PROTECTIVE_STOP_ORDER - 使用保护止损订单</option>
                                     <option value="STOP_ORDER_POLL_SECONDS">STOP_ORDER_POLL_SECONDS - 止损订单轮询间隔(秒)</option>
+                                    <option value="STOP_ARM_MAX_RETRIES">STOP_ARM_MAX_RETRIES - 停止订单重试最大次数</option>
+                                    <option value="STOP_ARM_BACKOFF_BASE_SECONDS">STOP_ARM_BACKOFF_BASE_SECONDS - 停止订单重试退避基数(秒)</option>
+                                    <option value="STOP_REARM_MAX_ATTEMPTS">STOP_REARM_MAX_ATTEMPTS - 停止订单重新上架最大尝试次数</option>
+                                    <option value="STOP_REARM_COOLDOWN_SECONDS">STOP_REARM_COOLDOWN_SECONDS - 停止订单重新上架冷却时间(秒)</option>
+                                </optgroup>
+                                <optgroup label="其他参数">
+                                    <option value="SYMBOLS">SYMBOLS - 交易对列表</option>
                                 </optgroup>
                             </select>
                             <input type="text" id="config-key" placeholder="或手动输入参数名（如: SETUP_B_ADX_MIN）" oninput="onConfigKeyInput()">
@@ -646,6 +671,26 @@
                 desc: '止损订单轮询间隔（秒），检查止损订单状态的间隔',
                 example: '10',
                 recommended: '10'
+            },
+            'STOP_ARM_MAX_RETRIES': {
+                desc: '停止订单重试最大次数，上架失败时重试次数',
+                example: '3',
+                recommended: '3'
+            },
+            'STOP_ARM_BACKOFF_BASE_SECONDS': {
+                desc: '停止订单重试退避基数（秒），每次重试的延迟时间基数',
+                example: '0.5',
+                recommended: '0.5'
+            },
+            'STOP_REARM_MAX_ATTEMPTS': {
+                desc: '停止订单重新上架最大尝试次数，订单失效后重新上架的次数',
+                example: '2',
+                recommended: '2'
+            },
+            'STOP_REARM_COOLDOWN_SECONDS': {
+                desc: '停止订单重新上架冷却时间（秒），重新上架前的等待时间',
+                example: '60',
+                recommended: '60'
             }
         };
 
@@ -738,7 +783,20 @@
             document.getElementById(`${tab}-tab`).classList.add('active');
 
             if (tab === 'status') loadStatus();
-            if (tab === 'config') { loadConfigs(); loadStatus(); }
+            if (tab === 'config') { 
+                loadConfigs().then(() => {
+                    // 配置加载完成后，如果已选择参数，更新当前值显示
+                    const select = document.getElementById('config-key-select');
+                    const input = document.getElementById('config-key');
+                    if (select.value || input.value) {
+                        const key = select.value || input.value.toUpperCase();
+                        const currentValueEl = document.getElementById('config-current-value');
+                        const currentValueText = document.getElementById('config-current-value-text');
+                        showCurrentValue(key, currentValueEl, currentValueText);
+                    }
+                });
+                loadStatus();
+            }
         }
 
         // 初始化
