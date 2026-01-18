@@ -225,6 +225,25 @@ class MarketDataWebSocketService:
         """处理 K线消息"""
         try:
             if self.exchange == "bybit":
+                # Bybit V5 K线消息格式：{"topic":"kline.15.BTCUSDT","data":[{"start":...,"end":...,"interval":"15","open":"...","close":"...","high":"...","low":"...","volume":"...","turnover":"...","confirm":true,...}]}
+                # confirm 字段表示 K线是否已关闭
+                data = message.data if hasattr(message, 'data') else (message.raw.get("data", []) if isinstance(message.raw.get("data"), list) else [])
+                
+                if isinstance(data, list) and len(data) > 0:
+                    kline_data = data[0]
+                elif isinstance(data, dict):
+                    kline_data = data
+                else:
+                    return
+                
+                # 检查 confirms 字段（Bybit V5 中确认的 K线才是已关闭的）
+                confirms = kline_data.get("confirm", False)  # Bybit V5 使用 "confirm" 字段
+                if not confirms:
+                    # 未关闭的 K线不保存到数据库，只更新缓存用于显示
+                    _logger.debug(f"[{self.service_name}] Bybit kline not confirmed yet, skipping save: {kline_data.get('symbol', '')}")
+                    return
+                
+                # 解析 K线数据
                 kline = self.ws_client.parse_kline(message)
                 if not kline:
                     return

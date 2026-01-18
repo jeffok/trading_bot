@@ -506,28 +506,60 @@ def admin_status(
         }
 
     # market data lag per symbol and latest price
-    # 优先从 market_data 表获取最新价格（WebSocket 实时数据）
+    # 使用 market_data 表的最新数据（WebSocket 实时数据）
+    # 延迟计算：now_ms - (last_open_time_ms + interval_ms) = now_ms - close_time_ms
     interval_minutes = int(settings.interval_minutes)
+    interval_ms = interval_minutes * 60_000
     feature_version = int(settings.feature_version)
+    
+    # 优先使用 market_data 表（WebSocket 实时数据），获取最新 K线
+    # 如果没有 market_data，则使用 market_data_cache
+    effective_symbols_list = list(effective_symbols) if effective_symbols else []
+    if not effective_symbols_list:
+        effective_symbols_list = ["BTCUSDT", "ETHUSDT"]  # 默认交易对
+    
     md_rows = db.fetch_all(
         """
-        SELECT 
-            c.symbol, 
-            MAX(c.open_time_ms) AS last_open_time_ms,
-            (SELECT close_price FROM market_data m
-             WHERE m.symbol=c.symbol AND m.interval_minutes=%s 
-             ORDER BY m.open_time_ms DESC LIMIT 1) AS latest_price
-        FROM market_data_cache c
-        WHERE c.interval_minutes=%s AND c.feature_version=%s
-        GROUP BY c.symbol
+        SELECT DISTINCT
+            COALESCE(m.symbol, s.symbol) AS symbol,
+            COALESCE(m.open_time_ms, c.last_open_time_ms) AS last_open_time_ms,
+            m.close_price AS latest_price
+        FROM (
+            SELECT unnest(%s::text[]) AS symbol
+        ) s
+        LEFT JOIN (
+            SELECT symbol, open_time_ms, close_price
+            FROM market_data
+            WHERE interval_minutes = %s
+            AND (symbol, open_time_ms) IN (
+                SELECT symbol, MAX(open_time_ms)
+                FROM market_data
+                WHERE interval_minutes = %s
+                GROUP BY symbol
+            )
+        ) m ON m.symbol = s.symbol
+        LEFT JOIN (
+            SELECT symbol, MAX(open_time_ms) AS last_open_time_ms
+            FROM market_data_cache
+            WHERE interval_minutes=%s AND feature_version=%s
+            GROUP BY symbol
+        ) c ON c.symbol = s.symbol
         """,
-        (interval_minutes, interval_minutes, feature_version),
+        (effective_symbols_list, interval_minutes, interval_minutes, interval_minutes, feature_version),
     )
     now_ms = int(time.time() * 1000)
     data_lag: List[Dict[str, Any]] = []
     for r in md_rows or []:
         last_ot = int(r["last_open_time_ms"]) if r["last_open_time_ms"] is not None else None
-        lag_ms = (now_ms - last_ot) if last_ot else None
+        # 正确的延迟计算：now_ms - (open_time_ms + interval_ms) = now_ms - close_time_ms
+        # 或者简化为：now_ms - last_ot - interval_ms
+        if last_ot:
+            # 计算 K线收盘时间：open_time_ms + interval_ms
+            close_time_ms = last_ot + interval_ms
+            lag_ms = max(0, now_ms - close_time_ms)
+        else:
+            lag_ms = None
+        
         latest_price = float(r["latest_price"]) if r["latest_price"] is not None else None
         data_lag.append({
             "symbol": r["symbol"], 
