@@ -594,9 +594,9 @@ def admin_halt(
     write_control_command(
         db,
         command="HALT",
-        payload={"actor": cmd.by, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        payload={"actor": cmd.actor, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
         trace_id=trace_id,
-        actor=cmd.by,
+        actor=cmd.actor,
         reason_code=cmd.reason_code,
         reason=cmd.reason,
     )
@@ -636,9 +636,9 @@ def admin_resume(
     write_control_command(
         db,
         command="RESUME",
-        payload={"actor": cmd.by, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        payload={"actor": cmd.actor, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
         trace_id=trace_id,
-        actor=cmd.by,
+        actor=cmd.actor,
         reason_code=cmd.reason_code,
         reason=cmd.reason,
     )
@@ -679,9 +679,9 @@ def admin_emergency_exit(
     write_control_command(
         db,
         command="EMERGENCY_EXIT",
-        payload={"actor": cmd.by, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        payload={"actor": cmd.actor, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
         trace_id=trace_id,
-        actor=cmd.by,
+        actor=cmd.actor,
         reason_code=cmd.reason_code,
         reason=cmd.reason,
     )
@@ -727,9 +727,9 @@ def admin_update_config(
     write_control_command(
         db,
         command="UPDATE_CONFIG",
-        payload={"actor": cmd.by, "key": cmd.key, "value": cmd.value, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
+        payload={"actor": cmd.actor, "key": cmd.key, "value": cmd.value, "reason_code": cmd.reason_code, "reason": cmd.reason, "trace_id": trace_id},
         trace_id=trace_id,
-        actor=cmd.by,
+        actor=cmd.actor,
         reason_code=cmd.reason_code,
         reason=cmd.reason,
     )
