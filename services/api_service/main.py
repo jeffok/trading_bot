@@ -549,7 +549,26 @@ def admin_status(
     )
     now_ms = int(time.time() * 1000)
     data_lag: List[Dict[str, Any]] = []
+    
+    # 尝试从 Redis 获取最新价格（价格服务的实时缓存）
+    price_cache: Dict[str, float] = {}
+    try:
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        r_client = redis_client(redis_url)
+        for symbol in effective_symbols_list:
+            key = f"market:price:{symbol}"
+            cached = r_client.get(key)
+            if cached:
+                try:
+                    price_data = json.loads(cached)
+                    price_cache[symbol] = float(price_data.get("price", 0))
+                except Exception:
+                    pass
+    except Exception:
+        pass  # Redis 不可用时忽略，使用数据库价格
+    
     for r in md_rows or []:
+        symbol = r["symbol"]
         last_ot = int(r["last_open_time_ms"]) if r["last_open_time_ms"] is not None else None
         # 正确的延迟计算：now_ms - (open_time_ms + interval_ms) = now_ms - close_time_ms
         # 或者简化为：now_ms - last_ot - interval_ms
@@ -560,9 +579,13 @@ def admin_status(
         else:
             lag_ms = None
         
-        latest_price = float(r["latest_price"]) if r["latest_price"] is not None else None
+        # 优先使用 Redis 缓存的价格（实时），如果没有则使用数据库中的 K线收盘价
+        latest_price = price_cache.get(symbol)
+        if latest_price is None:
+            latest_price = float(r["latest_price"]) if r["latest_price"] is not None else None
+        
         data_lag.append({
-            "symbol": r["symbol"], 
+            "symbol": symbol, 
             "last_open_time_ms": last_ot, 
             "lag_ms": lag_ms,
             "latest_price": latest_price

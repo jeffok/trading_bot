@@ -502,10 +502,69 @@
                 </div>
             `;
             document.getElementById('status-info').innerHTML = statusHtml;
-            document.getElementById('status').textContent = `最后更新: ${new Date().toLocaleString('zh-CN')}`;
+            updateLastUpdateTime();
             
             // 加载交易对同步状态表格
             loadSymbolStatusTable(status.data_lag || []);
+        }
+        
+        // 更新最后更新时间（实时显示）
+        function updateLastUpdateTime() {
+            const statusEl = document.getElementById('status');
+            if (!statusEl) return;
+            
+            const now = new Date();
+            statusEl.textContent = `最后更新: ${now.toLocaleString('zh-CN')}`;
+            
+            // 每秒更新一次（实时显示）
+            if (window.updateTimeInterval) {
+                clearInterval(window.updateTimeInterval);
+            }
+            window.updateTimeInterval = setInterval(() => {
+                const now = new Date();
+                statusEl.textContent = `最后更新: ${now.toLocaleString('zh-CN')}`;
+            }, 1000);
+        }
+        
+        // 格式化延迟时间显示
+        function formatLagDisplay(lagMs) {
+            if (lagMs === null || lagMs === undefined) {
+                return { text: '无数据', class: 'sync-status-error', isRealTime: false };
+            }
+            
+            // 小于5秒认为是实时
+            if (lagMs < 5000) {
+                return { text: '实时', class: 'sync-status-ok', isRealTime: true };
+            }
+            
+            // 小于1分钟显示秒数
+            if (lagMs < 60000) {
+                return { 
+                    text: `延迟 ${Math.floor(lagMs / 1000)}秒`, 
+                    class: 'sync-status-lag', 
+                    isRealTime: false 
+                };
+            }
+            
+            // 小于1小时显示分钟数
+            if (lagMs < 3600000) {
+                const minutes = Math.floor(lagMs / 60000);
+                const seconds = Math.floor((lagMs % 60000) / 1000);
+                return { 
+                    text: seconds > 0 ? `延迟 ${minutes}分${seconds}秒` : `延迟 ${minutes}分钟`, 
+                    class: 'sync-status-lag', 
+                    isRealTime: false 
+                };
+            }
+            
+            // 大于1小时显示小时和分钟
+            const hours = Math.floor(lagMs / 3600000);
+            const minutes = Math.floor((lagMs % 3600000) / 60000);
+            return { 
+                text: `严重延迟 ${hours}小时${minutes}分钟`, 
+                class: 'sync-status-error', 
+                isRealTime: false 
+            };
         }
         
         // 加载交易对同步状态表格
@@ -525,25 +584,12 @@
                     : 'N/A';
                 const lagMs = item.lag_ms;
                 
-                let syncStatus, statusClass;
-                if (lagMs === null || lagMs === undefined) {
-                    syncStatus = '无数据';
-                    statusClass = 'sync-status-error';
-                } else if (lagMs < 60000) { // 小于1分钟
-                    syncStatus = '正常';
-                    statusClass = 'sync-status-ok';
-                } else if (lagMs < 300000) { // 小于5分钟
-                    syncStatus = `延迟 ${Math.floor(lagMs / 1000)}秒`;
-                    statusClass = 'sync-status-lag';
-                } else {
-                    syncStatus = `严重延迟 ${Math.floor(lagMs / 60000)}分钟`;
-                    statusClass = 'sync-status-error';
-                }
+                const lagDisplay = formatLagDisplay(lagMs);
                 
                 return `
                     <tr>
                         <td><strong>${symbol}</strong></td>
-                        <td><span class="${statusClass}">${syncStatus}</span></td>
+                        <td><span class="${lagDisplay.class}">${lagDisplay.text}</span></td>
                         <td>${price}</td>
                     </tr>
                 `;
@@ -861,12 +907,18 @@
                 if (window.symbolStatusInterval) {
                     clearInterval(window.symbolStatusInterval);
                 }
-                window.symbolStatusInterval = setInterval(loadStatus, 5000);
+                window.symbolStatusInterval = setInterval(() => {
+                    loadStatus();
+                }, 5000);
             } else {
                 // 离开状态页时停止自动刷新
                 if (window.symbolStatusInterval) {
                     clearInterval(window.symbolStatusInterval);
                     window.symbolStatusInterval = null;
+                }
+                if (window.updateTimeInterval) {
+                    clearInterval(window.updateTimeInterval);
+                    window.updateTimeInterval = null;
                 }
             }
             if (tab === 'config') { 

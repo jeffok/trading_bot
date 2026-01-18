@@ -160,8 +160,24 @@ class PriceWebSocketService:
                 price = float(ticker.get("lastPrice", 0))
                 
             elif self.exchange == "binance":
-                # Binance 组合流格式: {"stream":"...","data":{...}}
-                data = message.data if hasattr(message, 'data') and message.data else message.raw.get("data", {})
+                # Binance 组合流格式: {"stream":"btcusdt@ticker","data":{...}}
+                # 单流格式: 直接是数据对象
+                if hasattr(message, 'raw') and message.raw:
+                    # 组合流格式：从 raw 中提取 stream 和 data
+                    raw_data = message.raw
+                    if "stream" in raw_data and "data" in raw_data:
+                        stream = raw_data.get("stream", "")
+                        data = raw_data.get("data", {})
+                        # 检查是否是 ticker 流
+                        if "@ticker" not in stream:
+                            return
+                    else:
+                        # 单流格式：直接是数据
+                        data = raw_data
+                else:
+                    # 尝试从 message.data 获取
+                    data = message.data if hasattr(message, 'data') and message.data else {}
+                
                 if not data:
                     return
                 
