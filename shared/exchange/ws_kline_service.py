@@ -291,7 +291,10 @@ class KlineWebSocketService:
     def get_sync_status(self, symbol: str) -> Dict[str, Any]:
         """获取同步状态"""
         with self._lock:
-            return self.sync_status.get(symbol, {}).copy()
+            status = self.sync_status.get(symbol, {}).copy()
+            # 添加连接状态，方便诊断
+            status["ws_connected"] = self.is_connected()
+            return status
     
     def is_connected(self) -> bool:
         """检查 WebSocket 是否连接"""

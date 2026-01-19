@@ -1018,12 +1018,29 @@ def main():
             for sym in symbols:
                 status = ws_sync_manager.get_sync_status(sym)
                 kline_ok = status.get("kline_ok", False)
+                ws_connected = status.get("ws_connected", False)
                 last_update = status.get("kline_last_update", 0)
                 now = now_ms()
-                # 如果超过 5 分钟没有更新，使用 REST 补齐
-                if not kline_ok or (now - last_update > 5 * 60 * 1000):
+                
+                # 如果 WebSocket 未连接，直接使用 REST
+                if not ws_connected:
                     use_rest_sync = True
-                    logger.warning(f"ws_sync_stale symbol={sym} kline_ok={kline_ok} last_update={last_update} using_rest_fallback")
+                    logger.warning(f"ws_not_connected symbol={sym} using_rest_fallback")
+                    break
+                
+                # 根据K线周期调整检查时间：15分钟K线需要至少等待2个周期+5分钟才认为stale
+                # 对于15分钟K线，允许最多35分钟（2个周期+5分钟缓冲）没有更新
+                interval_minutes = int(settings.interval_minutes)
+                stale_threshold_ms = max(5 * 60 * 1000, (interval_minutes * 2 + 5) * 60 * 1000)
+                
+                # 如果从未收到过数据（last_update=0），且连接时间超过阈值，认为 stale
+                if last_update == 0:
+                    # 如果连接已建立但从未收到数据，等待一个周期后认为 stale
+                    stale_threshold_ms = interval_minutes * 60 * 1000
+                
+                if not kline_ok or (last_update > 0 and (now - last_update > stale_threshold_ms)):
+                    use_rest_sync = True
+                    logger.warning(f"ws_sync_stale symbol={sym} kline_ok={kline_ok} ws_connected={ws_connected} last_update={last_update} stale_threshold_ms={stale_threshold_ms} using_rest_fallback")
                     break
         
         # REST API 同步（仅在需要时使用）

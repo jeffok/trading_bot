@@ -1488,31 +1488,33 @@ def main():
     next_stop_poll_ts = time.time() + float(max(1, int(runtime_cfg.stop_order_poll_seconds)))
 
     while True:
-        # leader election: only leader executes trading ticks; followers only heartbeat + metrics
-        is_leader = True
-        if settings.leader_election_enabled:
-            is_leader = elector.ensure()
-        metrics.leader_is_leader.labels(SERVICE, instance_id).set(1 if is_leader else 0)
-
-        role = "leader" if is_leader else "follower"
-        if role != last_role:
-            metrics.leader_changes_total.labels(SERVICE, instance_id, role).inc()
-            last_role = role
-
-        # heartbeat (liveness)
         try:
-            upsert_service_status(db, service_name=SERVICE, instance_id=instance_id, status={"status": "RUNNING", "role": role, "leader": elector.get_leader() if settings.leader_election_enabled else instance_id, "symbols_count": len(symbols), "symbols_from_db": runtime_cfg.symbols_from_db, "halt_trading": bool(runtime_cfg.halt_trading), "emergency_exit": bool(runtime_cfg.emergency_exit)})
-        except Exception:
-            pass
+            # leader election: only leader executes trading ticks; followers only heartbeat + metrics
+            is_leader = True
+            if settings.leader_election_enabled:
+                is_leader = elector.ensure()
+            metrics.leader_is_leader.labels(SERVICE, instance_id).set(1 if is_leader else 0)
 
-        if not is_leader:
-            time.sleep(settings.leader_follower_sleep_seconds)
-            continue
+            role = "leader" if is_leader else "follower"
+            if role != last_role:
+                metrics.leader_changes_total.labels(SERVICE, instance_id, role).inc()
+                last_role = role
 
-        # Sleep until next tick, but keep refreshing runtime config so SYMBOLS/HALT/EMERGENCY can hot-reload
-        sleep_s = next_tick_sleep_seconds(settings.strategy_tick_seconds)
-        end_ts = time.time() + float(sleep_s)
-        while time.time() < end_ts:
+            # heartbeat (liveness) - 确保每次循环都更新，即使后续逻辑出错
+            try:
+                upsert_service_status(db, service_name=SERVICE, instance_id=instance_id, status={"status": "RUNNING", "role": role, "leader": elector.get_leader() if settings.leader_election_enabled else instance_id, "symbols_count": len(symbols), "symbols_from_db": runtime_cfg.symbols_from_db, "halt_trading": bool(runtime_cfg.halt_trading), "emergency_exit": bool(runtime_cfg.emergency_exit)})
+            except Exception as e:
+                logger.error(f"heartbeat_update_failed err={e}", exc_info=True)
+                # 即使心跳更新失败，也继续运行，避免服务完全停止
+
+            if not is_leader:
+                time.sleep(settings.leader_follower_sleep_seconds)
+                continue
+
+            # Sleep until next tick, but keep refreshing runtime config so SYMBOLS/HALT/EMERGENCY can hot-reload
+            sleep_s = next_tick_sleep_seconds(settings.strategy_tick_seconds)
+            end_ts = time.time() + float(sleep_s)
+            while time.time() < end_ts:
             if time.time() >= next_cfg_refresh_ts:
                 try:
                     changes = runtime_cfg.refresh(db, settings)
@@ -1667,13 +1669,13 @@ def main():
 
             time.sleep(min(2.0, max(0.1, end_ts - time.time())))
 
-        trace_id = new_trace_id("tick")
+            trace_id = new_trace_id("tick")
 
-        try:
-            # HALT_TRADING: hot-reload from system_config
-            if bool(runtime_cfg.halt_trading):
-                telegram.send(f"[HALT] 本轮跳过 trace_id={trace_id} symbols={','.join(symbols)}")
-                continue
+            try:
+                # HALT_TRADING: hot-reload from system_config
+                if bool(runtime_cfg.halt_trading):
+                    telegram.send(f"[HALT] 本轮跳过 trace_id={trace_id} symbols={','.join(symbols)}")
+                    continue
 
             tick_id = int(time.time() // settings.strategy_tick_seconds)
 
@@ -2739,6 +2741,9 @@ def main():
                 pass
             time.sleep(max(0.5, float(sleep_s)))
             continue
+        except KeyboardInterrupt:
+            logger.info("Received SIGINT, shutting down gracefully")
+            break
         except Exception as e:
             # 全局异常：避免某一个 symbol 的错误把整个服务打崩
             for sym in symbols:
@@ -2753,6 +2758,33 @@ def main():
                 log_action(logger, action="ENGINE_ERROR", trace_id=trace_id, reason_code="ERROR", reason=str(e)[:200], client_order_id=None)
             except Exception:
                 pass
+            # 等待一段时间后继续，避免快速重试导致问题
+            time.sleep(10.0)
+            continue
+        except KeyboardInterrupt:
+            logger.info("Received SIGINT, shutting down gracefully")
+            break
+        except Exception as e:
+            # 主循环外层异常捕获，确保服务不会完全停止
+            logger.error(f"main_loop_error err={e}", exc_info=True)
+            try:
+                send_system_alert(
+                    telegram,
+                    title="❌ 策略引擎主循环异常",
+                    summary_kv=build_system_summary(
+                        event="MAIN_LOOP_ERROR",
+                        trace_id=new_trace_id("main_loop_error"),
+                        exchange=settings.exchange,
+                        level="ERROR",
+                        reason=str(e)[:200]
+                    ),
+                    payload={"error": str(e)},
+                )
+            except Exception:
+                pass
+            # 等待一段时间后继续，避免快速重试导致问题
+            time.sleep(10.0)
+            continue
 
 if __name__ == "__main__":
     main()
