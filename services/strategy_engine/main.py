@@ -1515,159 +1515,159 @@ def main():
             sleep_s = next_tick_sleep_seconds(settings.strategy_tick_seconds)
             end_ts = time.time() + float(sleep_s)
             while time.time() < end_ts:
-            if time.time() >= next_cfg_refresh_ts:
+                if time.time() >= next_cfg_refresh_ts:
+                    try:
+                        changes = runtime_cfg.refresh(db, settings)
+                        metrics.runtime_config_refresh_total.labels(SERVICE).inc()
+                        metrics.runtime_config_symbols_count.labels(SERVICE).set(len(runtime_cfg.symbols))
+                        metrics.runtime_config_last_refresh_ms.labels(SERVICE).set(runtime_cfg.last_refresh_ms)
+                        if "symbols" in changes:
+                            symbols = list(runtime_cfg.symbols)
+                            logger.info(f"runtime_config_symbols_updated symbols={symbols} symbols_from_db={runtime_cfg.symbols_from_db}")
+                    except Exception as e:
+                        logger.warning(f"runtime_config_refresh_failed err={e}")
+                    next_cfg_refresh_ts = time.time() + float(settings.runtime_config_refresh_seconds)
+
+                # periodic position snapshots (V8.3): every N seconds write a snapshot for active positions
                 try:
-                    changes = runtime_cfg.refresh(db, settings)
-                    metrics.runtime_config_refresh_total.labels(SERVICE).inc()
-                    metrics.runtime_config_symbols_count.labels(SERVICE).set(len(runtime_cfg.symbols))
-                    metrics.runtime_config_last_refresh_ms.labels(SERVICE).set(runtime_cfg.last_refresh_ms)
-                    if "symbols" in changes:
-                        symbols = list(runtime_cfg.symbols)
-                        logger.info(f"runtime_config_symbols_updated symbols={symbols} symbols_from_db={runtime_cfg.symbols_from_db}")
-                except Exception as e:
-                    logger.warning(f"runtime_config_refresh_failed err={e}")
-                next_cfg_refresh_ts = time.time() + float(settings.runtime_config_refresh_seconds)
-
-            # periodic position snapshots (V8.3): every N seconds write a snapshot for active positions
-            try:
-                if time.time() >= next_snapshot_ts and symbols:
-                    snap_trace_id = new_trace_id("pos_snap")
-                    interval_s = float(getattr(settings, "position_snapshot_interval_seconds", 300) or 300)
-                    for sym in list(symbols):
-                        try:
-                            pos_row = get_position(db, sym)
-                            if not pos_row:
-                                continue
-                            base_qty = float(pos_row.get("base_qty") or 0.0)
-                            if base_qty <= 0:
-                                continue
-                            created_at = pos_row.get("created_at")
-                            # If DB time not parsed, still write best-effort every interval
-                            should_write = True
+                    if time.time() >= next_snapshot_ts and symbols:
+                        snap_trace_id = new_trace_id("pos_snap")
+                        interval_s = float(getattr(settings, "position_snapshot_interval_seconds", 300) or 300)
+                        for sym in list(symbols):
                             try:
-                                if created_at is not None:
-                                    # PostgreSQL returns datetime
-                                    age = (datetime.datetime.utcnow() - created_at).total_seconds()
-                                    should_write = age >= max(30.0, interval_s * 0.9)
-                            except Exception:
+                                pos_row = get_position(db, sym)
+                                if not pos_row:
+                                    continue
+                                base_qty = float(pos_row.get("base_qty") or 0.0)
+                                if base_qty <= 0:
+                                    continue
+                                created_at = pos_row.get("created_at")
+                                # If DB time not parsed, still write best-effort every interval
                                 should_write = True
-                            if not should_write:
+                                try:
+                                    if created_at is not None:
+                                        # PostgreSQL returns datetime
+                                        age = (datetime.datetime.utcnow() - created_at).total_seconds()
+                                        should_write = age >= max(30.0, interval_s * 0.9)
+                                except Exception:
+                                    should_write = True
+                                if not should_write:
+                                    continue
+                                meta = _parse_json_maybe(pos_row.get("meta_json"))
+                                meta["note"] = "periodic_snapshot"
+                                meta["trace_id"] = snap_trace_id
+                                save_position(db, sym, float(base_qty), float(pos_row.get("avg_entry_price")) if pos_row.get("avg_entry_price") is not None else None, meta)
+                            except Exception:
                                 continue
-                            meta = _parse_json_maybe(pos_row.get("meta_json"))
-                            meta["note"] = "periodic_snapshot"
-                            meta["trace_id"] = snap_trace_id
-                            save_position(db, sym, float(base_qty), float(pos_row.get("avg_entry_price")) if pos_row.get("avg_entry_price") is not None else None, meta)
-                        except Exception:
-                            continue
-                    next_snapshot_ts = time.time() + interval_s
-            except Exception:
-                pass
+                        next_snapshot_ts = time.time() + interval_s
+                except Exception:
+                    pass
 
-            # protective stop poll (between ticks) - for crash recovery / timely stop fill detection
-            try:
-                if (
-                    time.time() >= next_stop_poll_ts
-                    and bool(runtime_cfg.use_protective_stop_order)
-                    and settings.exchange != "paper"
-                    and symbols
-                ):
-                    poll_trace_id = new_trace_id("stop_poll")
-                    # Only poll symbols that currently have a position > 0
-                    for sym in list(symbols):
-                        try:
-                            pos = get_position(db, sym)
-                            base_qty = float(pos["base_qty"]) if pos else 0.0
-                            avg_entry = float(pos["avg_entry_price"]) if pos and pos["avg_entry_price"] is not None else None
-                            if base_qty <= 0:
-                                continue
+                # protective stop poll (between ticks) - for crash recovery / timely stop fill detection
+                try:
+                    if (
+                        time.time() >= next_stop_poll_ts
+                        and bool(runtime_cfg.use_protective_stop_order)
+                        and settings.exchange != "paper"
+                        and symbols
+                    ):
+                        poll_trace_id = new_trace_id("stop_poll")
+                        # Only poll symbols that currently have a position > 0
+                        for sym in list(symbols):
+                            try:
+                                pos = get_position(db, sym)
+                                base_qty = float(pos["base_qty"]) if pos else 0.0
+                                avg_entry = float(pos["avg_entry_price"]) if pos and pos["avg_entry_price"] is not None else None
+                                if base_qty <= 0:
+                                    continue
 
-                            meta_before = _parse_json_maybe(pos.get("meta_json") if pos else None)
-                            closed_by_stop, meta_after = _ensure_protective_stop(
-                                exchange=ex,
-                                db=db,
-                                metrics=metrics,
-                                telegram=telegram,
-                                settings=settings,
-                                runtime_cfg=runtime_cfg,
-                                symbol=sym,
-                                base_qty=float(base_qty),
-                                avg_entry=avg_entry,
-                                pos_row=pos,
-                                trace_id=poll_trace_id,
-                            )
-                            if meta_after != meta_before:
-                                save_position(
-                                    db,
-                                    sym,
-                                    float(base_qty),
-                                    float(avg_entry) if avg_entry is not None else None,
-                                    meta_after,
+                                meta_before = _parse_json_maybe(pos.get("meta_json") if pos else None)
+                                closed_by_stop, meta_after = _ensure_protective_stop(
+                                    exchange=ex,
+                                    db=db,
+                                    metrics=metrics,
+                                    telegram=telegram,
+                                    settings=settings,
+                                    runtime_cfg=runtime_cfg,
+                                    symbol=sym,
+                                    base_qty=float(base_qty),
+                                    avg_entry=avg_entry,
+                                    pos_row=pos,
+                                    trace_id=poll_trace_id,
                                 )
-
-                            if closed_by_stop:
-                                stop_fill = meta_after.pop("_stop_fill", {}) if isinstance(meta_after, dict) else {}
-                                exit_price = stop_fill.get("avg_price") or meta_after.get("stop_price") or avg_entry
-                                trade_id2 = _find_open_trade_id(db, sym, meta_after if isinstance(meta_after, dict) else {})
-                                save_position(
-                                    db,
-                                    sym,
-                                    0.0,
-                                    None,
-                                    {"trace_id": poll_trace_id, "note": "protective_stop_filled", "trade_id": trade_id2},
-                                )
-                                if trade_id2 > 0:
-                                    _close_trade_and_train(
+                                if meta_after != meta_before:
+                                    save_position(
                                         db,
-                                        settings,
-                                        metrics,
-                                        _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
-                                        trade_id=trade_id2,
-                                        symbol=sym,
-                                        qty=float(base_qty),
-                                        exit_price=float(exit_price) if exit_price is not None else None,
-                                        pnl_usdt=stop_fill.get("pnl_usdt"),
-                                        close_reason_code=ReasonCode.STOP_LOSS.value,
-                                        close_reason="Protective stop filled (exchange)",
-                                        trace_id=poll_trace_id,
-                                        runtime_cfg=runtime_cfg,
+                                        sym,
+                                        float(base_qty),
+                                        float(avg_entry) if avg_entry is not None else None,
+                                        meta_after,
                                     )
-                                summary_kv = build_trade_summary(
-                                    event="PROTECTIVE_STOP_FILLED",
-                                    trace_id=poll_trace_id,
-                                    exchange=exchange,
-                                    symbol=sym,
-                                    side="SELL",
-                                    qty=base_qty,
-                                    price=exit_price,
-                                    stop_price=None,
-                                    reason_code=ReasonCode.STOP_LOSS,
-                                    reason="Protective stop filled (exchange)",
-                                    extra={"trade_id": str(trade_id2)},
-                                )
-                                send_trade_alert(telegram, title="交易所止损单成交", summary_kv=summary_kv, payload={})
-                                log_action(
-                                    logger,
-                                    "PROTECTIVE_STOP_FILLED",
-                                    trace_id=poll_trace_id,
-                                    exchange=exchange,
-                                    symbol=sym,
-                                    side="SELL",
-                                    qty=base_qty,
-                                    price=exit_price,
-                                    reason_code=ReasonCode.STOP_LOSS.value,
-                                    reason="Protective stop filled (exchange)",
-                                )
-                        except RateLimitError:
-                            breaker.record_rate_limit()
-                            # avoid hammering exchange during stop polling
-                            break
-                        except Exception:
-                            pass
-                    next_stop_poll_ts = time.time() + float(max(1, int(runtime_cfg.stop_order_poll_seconds)))
-            except Exception:
-                pass
 
-            time.sleep(min(2.0, max(0.1, end_ts - time.time())))
+                                if closed_by_stop:
+                                    stop_fill = meta_after.pop("_stop_fill", {}) if isinstance(meta_after, dict) else {}
+                                    exit_price = stop_fill.get("avg_price") or meta_after.get("stop_price") or avg_entry
+                                    trade_id2 = _find_open_trade_id(db, sym, meta_after if isinstance(meta_after, dict) else {})
+                                    save_position(
+                                        db,
+                                        sym,
+                                        0.0,
+                                        None,
+                                        {"trace_id": poll_trace_id, "note": "protective_stop_filled", "trade_id": trade_id2},
+                                    )
+                                    if trade_id2 > 0:
+                                        _close_trade_and_train(
+                                            db,
+                                            settings,
+                                            metrics,
+                                            _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
+                                            trade_id=trade_id2,
+                                            symbol=sym,
+                                            qty=float(base_qty),
+                                            exit_price=float(exit_price) if exit_price is not None else None,
+                                            pnl_usdt=stop_fill.get("pnl_usdt"),
+                                            close_reason_code=ReasonCode.STOP_LOSS.value,
+                                            close_reason="Protective stop filled (exchange)",
+                                            trace_id=poll_trace_id,
+                                            runtime_cfg=runtime_cfg,
+                                        )
+                                    summary_kv = build_trade_summary(
+                                        event="PROTECTIVE_STOP_FILLED",
+                                        trace_id=poll_trace_id,
+                                        exchange=exchange,
+                                        symbol=sym,
+                                        side="SELL",
+                                        qty=base_qty,
+                                        price=exit_price,
+                                        stop_price=None,
+                                        reason_code=ReasonCode.STOP_LOSS,
+                                        reason="Protective stop filled (exchange)",
+                                        extra={"trade_id": str(trade_id2)},
+                                    )
+                                    send_trade_alert(telegram, title="交易所止损单成交", summary_kv=summary_kv, payload={})
+                                    log_action(
+                                        logger,
+                                        "PROTECTIVE_STOP_FILLED",
+                                        trace_id=poll_trace_id,
+                                        exchange=exchange,
+                                        symbol=sym,
+                                        side="SELL",
+                                        qty=base_qty,
+                                        price=exit_price,
+                                        reason_code=ReasonCode.STOP_LOSS.value,
+                                        reason="Protective stop filled (exchange)",
+                                    )
+                            except RateLimitError:
+                                breaker.record_rate_limit()
+                                # avoid hammering exchange during stop polling
+                                break
+                            except Exception:
+                                pass
+                        next_stop_poll_ts = time.time() + float(max(1, int(runtime_cfg.stop_order_poll_seconds)))
+                except Exception:
+                    pass
+
+                time.sleep(min(2.0, max(0.1, end_ts - time.time())))
 
             trace_id = new_trace_id("tick")
 
@@ -1677,703 +1677,158 @@ def main():
                     telegram.send(f"[HALT] 本轮跳过 trace_id={trace_id} symbols={','.join(symbols)}")
                     continue
 
-            tick_id = int(time.time() // settings.strategy_tick_seconds)
+                tick_id = int(time.time() // settings.strategy_tick_seconds)
 
-            tick_start_ts = time.time()
-            def _budget_exceeded() -> bool:
-                return (time.time() - float(tick_start_ts)) > float(settings.tick_budget_seconds)
+                tick_start_ts = time.time()
+                def _budget_exceeded() -> bool:
+                    return (time.time() - float(tick_start_ts)) > float(settings.tick_budget_seconds)
 
-            # best-effort reconcile (stale CREATED/SUBMITTED orders)
-            try:
-                fixed = reconcile_stale_orders(db, ex, exchange_name=settings.exchange, max_age_seconds=180, metrics=metrics, telegram=telegram)
-                if fixed:
-                    logger.info(f"reconcile_fixed={fixed} trace_id={trace_id}")
-            except Exception:
-                pass
+                # best-effort reconcile (stale CREATED/SUBMITTED orders)
+                try:
+                    fixed = reconcile_stale_orders(db, ex, exchange_name=settings.exchange, max_age_seconds=180, metrics=metrics, telegram=telegram)
+                    if fixed:
+                        logger.info(f"reconcile_fixed={fixed} trace_id={trace_id}")
+                except Exception:
+                    pass
 
-            # 先计算“当前全局已持仓数量”，用于限制最多 3 单（跨交易对）
-            pos_map = get_latest_positions_map(db, tuple(symbols))
-            open_cnt = sum(1 for q in pos_map.values() if q > 0)
+                # 先计算"当前全局已持仓数量"，用于限制最多 3 单（跨交易对）
+                pos_map = get_latest_positions_map(db, tuple(symbols))
+                open_cnt = sum(1 for q in pos_map.values() if q > 0)
 
-            # --- AI 选币：从 SYMBOLS(10-20) 中选择“最优”开仓币对 ---
-            # 需求：同一时间最多只允许 MAX_CONCURRENT_POSITIONS 个仓位（跨交易对全局限制）。
-            # 我们对“当前无持仓”的币对计算 BUY 信号与机器人评分，并按评分排序，取前 N 个执行开仓。
-            selected_open_symbols: set[str] = set()
-            selected_open_meta: dict[str, dict] = {}
-            try:
-                max_pos = int(runtime_cfg.max_concurrent_positions)
-                available_slots = max(0, max_pos - open_cnt)
-                if available_slots > 0:
-                    candidates = []  # (combined_score, symbol, meta)
-                    ai_model = _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None
-                    for s in symbols:
-                        if _budget_exceeded():
-                            log_action(logger, "TICK_TIME_BUDGET_EXCEEDED", trace_id=trace_id, reason_code=ReasonCode.TICK_TIMEOUT.value, reason=f"tick budget exceeded during selection (>{settings.tick_budget_seconds}s)")
-                            break
-                        if float(pos_map.get(s, 0.0) or 0.0) > 0.0:
-                            continue  # 已有仓位的币对不参与“选币开仓”，但仍会参与后续平仓/止损逻辑
-                        latest_s, prev_s = last_two_cache(db, s, settings.interval_minutes, settings.feature_version)
-                        if not latest_s:
-                            continue
-                        # 你要求的口径：MIN_ORDER_USDT 是“实际保证金(USDT)”，名义价值 = 价格*qty ≈ 保证金*杠杆。
-                        # 因此选币阶段也要用“保证金*杠杆”的方式反推 qty，避免选中后又因 qty 过小被跳过。
-                        try:
-                            last_px = float(latest_s.get("close_price") or 0.0)
-                        except Exception:
-                            last_px = 0.0
-                        if last_px <= 0:
-                            continue
-                        score_s = compute_robot_score(latest_s, signal="BUY")
-                        lev_s = leverage_from_score(settings, score_s)
-                        qty_s = min_qty_from_min_margin_usdt(runtime_cfg.min_order_usdt, last_px, lev_s, precision=6)
-                        if qty_s <= 0:
-                            continue
-                        ai_prob = None
-                        feat_bundle = {}
-                        if runtime_cfg.ai_enabled and ai_model is not None:
+                # --- AI 选币：从 SYMBOLS(10-20) 中选择"最优"开仓币对 ---
+                # 需求：同一时间最多只允许 MAX_CONCURRENT_POSITIONS 个仓位（跨交易对全局限制）。
+                # 我们对"当前无持仓"的币对计算 BUY 信号与机器人评分，并按评分排序，取前 N 个执行开仓。
+                selected_open_symbols: set[str] = set()
+                selected_open_meta: dict[str, dict] = {}
+                try:
+                    max_pos = int(runtime_cfg.max_concurrent_positions)
+                    available_slots = max(0, max_pos - open_cnt)
+                    if available_slots > 0:
+                        candidates = []  # (combined_score, symbol, meta)
+                        ai_model = _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None
+                        for s in symbols:
+                            if _budget_exceeded():
+                                log_action(logger, "TICK_TIME_BUDGET_EXCEEDED", trace_id=trace_id, reason_code=ReasonCode.TICK_TIMEOUT.value, reason=f"tick budget exceeded during selection (>{settings.tick_budget_seconds}s)")
+                                break
+                            if float(pos_map.get(s, 0.0) or 0.0) > 0.0:
+                                continue  # 已有仓位的币对不参与"选币开仓"，但仍会参与后续平仓/止损逻辑
+                            latest_s, prev_s = last_two_cache(db, s, settings.interval_minutes, settings.feature_version)
+                            if not latest_s:
+                                continue
+                            # 你要求的口径：MIN_ORDER_USDT 是"实际保证金(USDT)"，名义价值 = 价格*qty ≈ 保证金*杠杆。
+                            # 因此选币阶段也要用"保证金*杠杆"的方式反推 qty，避免选中后又因 qty 过小被跳过。
                             try:
-                                x, feat_bundle = _vectorize_for_ai(latest_s)
-                                ai_prob = float(ai_model.predict_proba(x))
-                                metrics.ai_predictions_total.labels(SERVICE, s).inc()
+                                last_px = float(latest_s.get("close_price") or 0.0)
                             except Exception:
-                                ai_prob = None
-                        combined = float(score_s)
-                        if ai_prob is not None:
-                            w = _clamp(float(runtime_cfg.ai_weight), 0.0, 1.0)
-                            combined = (1.0 - w) * float(score_s) + w * (ai_prob * 100.0)
-                        # V8.3 Setup B: decision must include AI score + prev bar for squeeze/mom flip
-                        ai_score_s = float(ai_prob * 100.0) if ai_prob is not None else 50.0
-                        should_buy_s, open_reason_code_s, open_reason_s = setup_b_decision(
-                            latest_s,
-                            prev_s,
-                            ai_score=ai_score_s,
-                            settings=settings,
-                            runtime_cfg=runtime_cfg,
-                        )
-                        if not should_buy_s:
-                            continue
-                        meta = {
-                            "robot_score": float(score_s),
-                            "ai_prob": ai_prob,
-                            "combined_score": float(combined),
-                            "features_bundle": feat_bundle,
-                            "open_reason_code": open_reason_code_s.value,
-                            "open_reason": open_reason_s,
-                        }
-                        candidates.append((float(combined), s, meta))
-                    # 按评分从高到低选择前 N 个开仓候选
-                    candidates.sort(key=lambda x: x[0], reverse=True)
-                    selected_open_symbols = set([sym for _, sym, _ in candidates[:available_slots]])
-                    selected_open_meta = {sym: meta for _, sym, meta in candidates[:available_slots]}
-            except Exception:
-                # 选币失败不应导致主循环崩溃：回退为“无候选”，本轮不主动开仓
-                selected_open_symbols = set()
-                selected_open_meta = {}
-            apply_control_commands(db, telegram, exchange=settings.exchange, trace_id=trace_id)
-            # Circuit breaker auto-halt
-            should_halt, note = breaker.should_halt()
-            if should_halt and get_flag(db, "HALT_TRADING", "false") != "true":
-                set_flag(db, "HALT_TRADING", "true")
-                send_system_alert(
-                    telegram,
-                    title="熔断触发暂停交易",
-                    summary_kv=build_system_summary(
-                        event="CIRCUIT_HALT",
+                                last_px = 0.0
+                            if last_px <= 0:
+                                continue
+                            score_s = compute_robot_score(latest_s, signal="BUY")
+                            lev_s = leverage_from_score(settings, score_s)
+                            qty_s = min_qty_from_min_margin_usdt(runtime_cfg.min_order_usdt, last_px, lev_s, precision=6)
+                            if qty_s <= 0:
+                                continue
+                            ai_prob = None
+                            feat_bundle = {}
+                            if runtime_cfg.ai_enabled and ai_model is not None:
+                                try:
+                                    x, feat_bundle = _vectorize_for_ai(latest_s)
+                                    ai_prob = float(ai_model.predict_proba(x))
+                                    metrics.ai_predictions_total.labels(SERVICE, s).inc()
+                                except Exception:
+                                    ai_prob = None
+                            combined = float(score_s)
+                            if ai_prob is not None:
+                                w = _clamp(float(runtime_cfg.ai_weight), 0.0, 1.0)
+                                combined = (1.0 - w) * float(score_s) + w * (ai_prob * 100.0)
+                            # V8.3 Setup B: decision must include AI score + prev bar for squeeze/mom flip
+                            ai_score_s = float(ai_prob * 100.0) if ai_prob is not None else 50.0
+                            should_buy_s, open_reason_code_s, open_reason_s = setup_b_decision(
+                                latest_s,
+                                prev_s,
+                                ai_score=ai_score_s,
+                                settings=settings,
+                                runtime_cfg=runtime_cfg,
+                            )
+                            if not should_buy_s:
+                                continue
+                            meta = {
+                                "robot_score": float(score_s),
+                                "ai_prob": ai_prob,
+                                "combined_score": float(combined),
+                                "features_bundle": feat_bundle,
+                                "open_reason_code": open_reason_code_s.value,
+                                "open_reason": open_reason_s,
+                            }
+                            candidates.append((float(combined), s, meta))
+                        # 按评分从高到低选择前 N 个开仓候选
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        selected_open_symbols = set([sym for _, sym, _ in candidates[:available_slots]])
+                        selected_open_meta = {sym: meta for _, sym, meta in candidates[:available_slots]}
+                except Exception:
+                    # 选币失败不应导致主循环崩溃：回退为"无候选"，本轮不主动开仓
+                    selected_open_symbols = set()
+                    selected_open_meta = {}
+                apply_control_commands(db, telegram, exchange=settings.exchange, trace_id=trace_id)
+                # Circuit breaker auto-halt
+                should_halt, note = breaker.should_halt()
+                if should_halt and get_flag(db, "HALT_TRADING", "false") != "true":
+                    set_flag(db, "HALT_TRADING", "true")
+                    send_system_alert(
+                        telegram,
+                        title="熔断触发暂停交易",
+                        summary_kv=build_system_summary(
+                            event="CIRCUIT_HALT",
+                            trace_id=trace_id,
+                            exchange=exchange,
+                            level="WARN",
+                            reason_code=ReasonCode.CIRCUIT_BREAKER_HALT,
+                            reason=note,
+                        ),
+                        payload={"note": note},
+                    )
+                    log_action(
+                        logger,
+                        action="CIRCUIT_BREAKER_HALT",
                         trace_id=trace_id,
-                        exchange=exchange,
-                        level="WARN",
                         reason_code=ReasonCode.CIRCUIT_BREAKER_HALT,
                         reason=note,
-                    ),
-                    payload={"note": note},
-                )
-                log_action(
-                    logger,
-                    action="CIRCUIT_BREAKER_HALT",
-                    trace_id=trace_id,
-                    reason_code=ReasonCode.CIRCUIT_BREAKER_HALT,
-                    reason=note,
-                    client_order_id=None,
-                )
-                append_order_event(db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol="*",
-                                 client_order_id=None, exchange_order_id=None, event_type=OrderEventType.ERROR,
-                                 side=Side.BUY.value, qty=0.0, price=None, status="HALT",
-                                 reason_code=ReasonCode.CIRCUIT_BREAKER_HALT.value, reason=note, payload={"window_seconds": breaker.window_seconds})
+                        client_order_id=None,
+                    )
+                    append_order_event(db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol="*",
+                                     client_order_id=None, exchange_order_id=None, event_type=OrderEventType.ERROR,
+                                     side=Side.BUY.value, qty=0.0, price=None, status="HALT",
+                                     reason_code=ReasonCode.CIRCUIT_BREAKER_HALT.value, reason=note, payload={"window_seconds": breaker.window_seconds})
 
-                log_action(logger, "CIRCUIT_BREAKER_HALT", trace_id=trace_id,
-                           reason_code=ReasonCode.CIRCUIT_BREAKER_HALT.value, reason=note,
-                           window_seconds=breaker.window_seconds)
+                    log_action(logger, "CIRCUIT_BREAKER_HALT", trace_id=trace_id,
+                               reason_code=ReasonCode.CIRCUIT_BREAKER_HALT.value, reason=note,
+                               window_seconds=breaker.window_seconds)
 
-            for symbol in symbols:
-                if _budget_exceeded():
-                    log_action(logger, "TICK_TIME_BUDGET_EXCEEDED", trace_id=trace_id, reason_code=ReasonCode.TICK_TIMEOUT.value, reason=f"tick budget exceeded before processing symbols (>{settings.tick_budget_seconds}s)")
-                    break
-                lock_key = f"asv8:lock:trade:{symbol}"
-                with distributed_lock(r, lock_key, ttl_ms=int(min(float(settings.trade_lock_ttl_seconds), float(settings.strategy_tick_seconds)) * 1000)) as acquired:
-                    if not acquired:
-                        continue
-
-                    latest, prev = last_two_cache(db, symbol, settings.interval_minutes, settings.feature_version)
-                    if not latest:
-                        continue
-
-                    last_price = float(latest["close_price"])
-                    if hasattr(ex, "update_last_price"):
-                        ex.update_last_price(symbol, last_price)
-
-                    pos = get_position(db, symbol)
-                    base_qty = float(pos["base_qty"]) if pos else 0.0
-                    avg_entry = float(pos["avg_entry_price"]) if pos and pos["avg_entry_price"] is not None else None
-
-                    # --- 交易所保护止损单：轮询 + 异常分支（拒绝/过期/取消）自动重挂或降级 ---
-                    if base_qty > 0 and bool(runtime_cfg.use_protective_stop_order) and settings.exchange != "paper":
-                        meta_before = _parse_json_maybe(pos.get("meta_json") if pos else None)
-                        closed_by_stop, meta_after = _ensure_protective_stop(
-                            exchange=ex,
-                            db=db,
-                            metrics=metrics,
-                            telegram=telegram,
-                            settings=settings,
-                            runtime_cfg=runtime_cfg,
-                            symbol=symbol,
-                            base_qty=float(base_qty),
-                            avg_entry=avg_entry,
-                            pos_row=pos,
-                            trace_id=trace_id,
-                        )
-                        # 仅当 meta 有变化时写快照（避免每轮都写）
-                        try:
-                            if meta_after != meta_before:
-                                save_position(db, symbol, float(base_qty), float(avg_entry) if avg_entry is not None else None, meta_after)
-                        except Exception:
-                            pass
-
-                        if closed_by_stop:
-                            # 止损单已成交 -> 更新本地仓位为 0，关闭 trade
-                            stop_fill = meta_after.pop("_stop_fill", {}) if isinstance(meta_after, dict) else {}
-                            exit_price = stop_fill.get("avg_price") or meta_after.get("stop_price") or avg_entry
-                            trade_id2 = _find_open_trade_id(db, symbol, meta_after if isinstance(meta_after, dict) else {})
-                            save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "protective_stop_filled", "trade_id": trade_id2})
-                            if trade_id2 > 0:
-                                _close_trade_and_train(
-                                    db,
-                                    settings,
-                                    metrics,
-                                    _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
-                                    trade_id=trade_id2,
-                                    symbol=symbol,
-                                    qty=float(base_qty),
-                                    exit_price=float(exit_price) if exit_price is not None else None,
-                                    pnl_usdt=stop_fill.get("pnl_usdt"),
-                                    close_reason_code=ReasonCode.STOP_LOSS.value,
-                                    close_reason="Protective stop filled (exchange)",
-                                    trace_id=trace_id,
-                                    runtime_cfg=runtime_cfg,
-                                )
-                            open_cnt = max(0, open_cnt - 1)
-                            stop_p = None
-                            try:
-                                stop_p = float(meta_after.get("stop_price") or 0.0) if isinstance(meta_after, dict) else None
-                            except Exception:
-                                stop_p = None
-                            summary_kv = build_trade_summary(
-                                event="PROTECTIVE_STOP_FILLED",
-                                trace_id=trace_id,
-                                exchange=exchange,
-                                symbol=symbol,
-                                side="SELL",
-                                qty=base_qty,
-                                price=exit_price,
-                                stop_price=stop_p,
-                                reason_code=ReasonCode.STOP_LOSS,
-                                reason="Protective stop filled (exchange)",
-                                extra={"pnl_usdt": stop_fill.get("pnl_usdt")},
-                            )
-                            send_trade_alert(
-                                telegram,
-                                title="交易所止损单成交",
-                                summary_kv=summary_kv,
-                                payload={"stop_fill": stop_fill},
-                            )
-                            log_action(
-                                logger,
-                                "PROTECTIVE_STOP_FILLED",
-                                trace_id=trace_id,
-                                exchange=exchange,
-                                symbol=symbol,
-                                side="SELL",
-                                qty=base_qty,
-                                price=exit_price,
-                                stop_price=stop_p,
-                                reason_code=ReasonCode.STOP_LOSS.value,
-                                reason="Protective stop filled (exchange)",
-                                pnl_usdt=stop_fill.get("pnl_usdt"),
-                            )
-                            try:
-                                metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "STOP_LOSS").inc()
-                            except Exception:
-                                pass
+                for symbol in symbols:
+                    if _budget_exceeded():
+                        log_action(logger, "TICK_TIME_BUDGET_EXCEEDED", trace_id=trace_id, reason_code=ReasonCode.TICK_TIMEOUT.value, reason=f"tick budget exceeded before processing symbols (>{settings.tick_budget_seconds}s)")
+                        break
+                    lock_key = f"asv8:lock:trade:{symbol}"
+                    with distributed_lock(r, lock_key, ttl_ms=int(min(float(settings.trade_lock_ttl_seconds), float(settings.strategy_tick_seconds)) * 1000)) as acquired:
+                        if not acquired:
                             continue
 
-                    # --- 紧急退出：对所有交易对生效 ---
-                    if bool(runtime_cfg.emergency_exit):
-                        if base_qty > 0:
-                            client_order_id = make_client_order_id(
-                                "exit",
-                                symbol,
-                                interval_minutes=settings.interval_minutes,
-                                kline_open_time_ms=int(latest["open_time_ms"]),
-                                trace_id=trace_id,
-                            )
-                            append_order_event(
-                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                                client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
-                                side=Side.SELL.value, qty=base_qty, price=None, status="CREATED",
-                                reason_code=ReasonCode.EMERGENCY_EXIT, reason="Emergency exit requested", payload={}
-                            )
-                            meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
-                            meta["base_qty"] = float(base_qty)
-                            if runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get("stop_client_order_id"):
-                                _cancel_protective_stop(exchange=ex, db=db, symbol=symbol, trace_id=trace_id, meta=meta)
-                            send_system_alert(
-                                telegram,
-                                title="紧急退出下单已提交",
-                                summary_kv=build_system_summary(
-                                    event="EMERGENCY_EXIT_SUBMITTED",
-                                    trace_id=trace_id,
-                                    exchange=exchange,
-                                    level="WARN",
-                                    extra={
-                                        "symbol": symbol,
-                                        "side": "SELL",
-                                        "qty": float(base_qty),
-                                        "last_price": float(last_price),
-                                        "client_order_id": client_order_id,
-                                    },
-                                ),
-                                payload={
-                                    "symbol": symbol,
-                                    "side": "SELL",
-                                    "qty": float(base_qty),
-                                    "last_price": float(last_price),
-                                    "client_order_id": client_order_id,
-                                },
-                            )
-                            summary_kv = build_trade_summary(
-                                event="STOP_LOSS_SUBMITTED",
-                                trace_id=trace_id,
-                                exchange=exchange,
-                                symbol=symbol,
-                                side="SELL",
-                                qty=base_qty,
-                                price=last_price,
-                                stop_price=stop_price,
-                                reason_code=ReasonCode.STOP_LOSS,
-                                reason=f"Hard stop loss submit: last={last_price} <= stop={stop_price}",
-                                client_order_id=client_order_id,
-                                status="SUBMITTING",
-                            )
-                            send_trade_alert(
-                                telegram,
-                                title="止损下单已提交",
-                                summary_kv=summary_kv,
-                                payload={
-                                    "client_order_id": client_order_id,
-                                    "symbol": symbol,
-                                    "side": "SELL",
-                                    "qty": float(base_qty),
-                                    "last_price": float(last_price),
-                                    "stop_price": float(stop_price),
-                                },
-                            )
-                            res = ex.place_market_order(symbol=symbol, side="SELL", qty=base_qty, client_order_id=client_order_id)
-                            append_order_event(
-                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                                client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
-                                event_type=_event_type_from_status(res.status),
-                                side=Side.SELL.value, qty=base_qty, price=res.avg_price, status=res.status,
-                                reason_code=ReasonCode.EMERGENCY_EXIT, reason="Emergency exit executed", payload=res.raw or {}
-                            )
-                            meta2 = _parse_json_maybe(pos.get("meta_json") if pos else None)
-                            trade_id2 = _find_open_trade_id(db, symbol, meta2)
-                            save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "emergency_exit", "trade_id": trade_id2})
-                            if trade_id2 > 0:
-                                _close_trade_and_train(
-                                    db,
-                                    settings,
-                                    metrics,
-                                    _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
-                                    trade_id=trade_id2,
-                                    symbol=symbol,
-                                    qty=float(base_qty),
-                                    exit_price=res.avg_price,
-                                    pnl_usdt=res.pnl_usdt,
-                                    close_reason_code=ReasonCode.EMERGENCY_EXIT.value,
-                                    close_reason="Emergency exit executed",
-                                    trace_id=trace_id,
-                                    runtime_cfg=runtime_cfg,
-                                )
-                            open_cnt = max(0, open_cnt - 1)
-                            send_system_alert(
-                                telegram,
-                                title="紧急退出已执行",
-                                summary_kv=build_system_summary(
-                                    event="EMERGENCY_EXIT_EXECUTED",
-                                    trace_id=trace_id,
-                                    exchange=exchange,
-                                    level="INFO",
-                                    extra={
-                                        "symbol": symbol,
-                                        "side": "SELL",
-                                        "qty": base_qty,
-                                        "price": res.avg_price,
-                                        "fee_usdt": res.fee_usdt,
-                                        "pnl_usdt": res.pnl_usdt,
-                                    },
-                                ),
-                                payload={
-                                    "client_order_id": client_order_id,
-                                    "exchange_order_id": res.exchange_order_id,
-                                    "avg_price": res.avg_price,
-                                    "fee_usdt": res.fee_usdt,
-                                    "pnl_usdt": res.pnl_usdt,
-                                },
-                            )
-
-                        # 当所有币对都检查完后再清掉 EMERGENCY_EXIT
-                        continue
-
-                    # --- 硬止损（逐仓合约） ---
-                    if base_qty > 0 and avg_entry is not None:
-                        meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
-                        stop_dist_pct = float(meta.get('stop_dist_pct') or runtime_cfg.hard_stop_loss_pct)
-                        stop_price = float(meta.get('stop_price') or (avg_entry * (1.0 - stop_dist_pct)))
-                        if last_price <= stop_price and not (runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get('stop_client_order_id')):
-                            client_order_id = make_client_order_id(
-                                "sl",
-                                symbol,
-                                interval_minutes=settings.interval_minutes,
-                                kline_open_time_ms=int(latest["open_time_ms"]),
-                                trace_id=trace_id,
-                            )
-                            append_order_event(
-                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                                client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
-                                side=Side.SELL.value, qty=base_qty, price=None, status="CREATED",
-                                reason_code=ReasonCode.STOP_LOSS,
-                                reason=f"Hard stop loss: last={last_price} <= stop={stop_price}",
-                                payload={"last_price": last_price, "stop_price": stop_price}
-                            )
-                            res = ex.place_market_order(symbol=symbol, side="SELL", qty=base_qty, client_order_id=client_order_id)
-                            append_order_event(
-                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                                client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
-                                event_type=_event_type_from_status(res.status),
-                                side=Side.SELL.value, qty=base_qty, price=res.avg_price, status=res.status,
-                                reason_code=ReasonCode.STOP_LOSS, reason="Stop loss executed", payload=res.raw or {}
-                            )
-                            meta2 = _parse_json_maybe(pos.get("meta_json") if pos else None)
-                            trade_id2 = _find_open_trade_id(db, symbol, meta2)
-                            save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "stop_loss", "trade_id": trade_id2})
-                            if trade_id2 > 0:
-                                _close_trade_and_train(
-                                    db,
-                                    settings,
-                                    metrics,
-                                    _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
-                                    trade_id=trade_id2,
-                                    symbol=symbol,
-                                    qty=float(base_qty),
-                                    exit_price=res.avg_price,
-                                    pnl_usdt=res.pnl_usdt,
-                                    close_reason_code=ReasonCode.STOP_LOSS.value,
-                                    close_reason="Hard stop loss triggered",
-                                    trace_id=trace_id,
-                                    runtime_cfg=runtime_cfg,
-                                )
-                            open_cnt = max(0, open_cnt - 1)
-                            summary_kv = build_trade_summary(
-                                event="STOP_LOSS",
-                                trace_id=trace_id,
-                                exchange=exchange,
-                                symbol=symbol,
-                                side="SELL",
-                                qty=base_qty,
-                                price=res.avg_price,
-                                stop_price=stop_price,
-                                reason_code=ReasonCode.STOP_LOSS,
-                                reason="Stop loss triggered",
-                                client_order_id=client_order_id,
-                                exchange_order_id=res.exchange_order_id,
-                                extra={"last_price": round(float(last_price), 4), "fee_usdt": res.fee_usdt, "pnl_usdt": res.pnl_usdt},
-                            )
-                            send_trade_alert(
-                                telegram,
-                                title="触发止损",
-                                summary_kv=summary_kv,
-                                payload={
-                                    "client_order_id": client_order_id,
-                                    "exchange_order_id": res.exchange_order_id,
-                                    "avg_price": res.avg_price,
-                                    "fee_usdt": res.fee_usdt,
-                                    "pnl_usdt": res.pnl_usdt,
-                                    "raw": res.raw or {},
-                                },
-                            )
-                            log_action(
-                                logger,
-                                "STOP_LOSS",
-                                trace_id=trace_id,
-                                exchange=exchange,
-                                symbol=symbol,
-                                side="SELL",
-                                qty=base_qty,
-                                price=res.avg_price,
-                                stop_price=stop_price,
-                                client_order_id=client_order_id,
-                                exchange_order_id=res.exchange_order_id,
-                                reason_code=ReasonCode.STOP_LOSS.value,
-                                reason="Stop loss triggered",
-                                pnl_usdt=res.pnl_usdt,
-                            )
-                            metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "STOP_LOSS").inc()
+                        latest, prev = last_two_cache(db, symbol, settings.interval_minutes, settings.feature_version)
+                        if not latest:
                             continue
 
-                    sig = setup_b_signal(latest)
-                    if sig == "BUY" and base_qty <= 0:
-                        # 多币对选币开仓：仅允许本轮被 AI 选中的币对执行开仓
-                        if symbol not in selected_open_symbols:
-                            continue
-                        # 全局最多 N 单（跨交易对）
-                        if open_cnt >= int(runtime_cfg.max_concurrent_positions):
-                            continue
+                        last_price = float(latest["close_price"])
+                        if hasattr(ex, "update_last_price"):
+                            ex.update_last_price(symbol, last_price)
 
-                        # 动态杠杆：10~20 倍（由机器人评分决定）
-                        meta_open = selected_open_meta.get(symbol, {})
-                        score = float(meta_open.get("robot_score") or compute_robot_score(latest, signal="BUY"))
-                        ai_prob = meta_open.get("ai_prob")
-                        combined_score = float(meta_open.get("combined_score") or score)
-                        feat_bundle = meta_open.get("features_bundle") or {}
-                        lev = leverage_from_score(settings, score)
-                        # V8.3 risk budget hard-constraint
-                        equity_usdt = get_equity_usdt(ex, settings, runtime_cfg)
-                        ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
-                        base_margin_usdt = compute_base_margin_usdt(equity_usdt=equity_usdt, ai_score=ai_score, settings=settings)
-                        ok_risk, lev2, risk_note = enforce_risk_budget(
-                            equity_usdt=equity_usdt,
-                            base_margin_usdt=base_margin_usdt,
-                            leverage=int(lev),
-                            stop_dist_pct=float(runtime_cfg.hard_stop_loss_pct),
-                            settings=settings,
-                            runtime_cfg=runtime_cfg,
-                        )
-                        if not ok_risk:
-                            append_order_event(
-                                db,
-                                trace_id=trace_id,
-                                service=SERVICE,
-                                exchange=exchange,
-                                symbol=symbol,
-                                client_order_id=None,
-                                exchange_order_id=None,
-                                event_type=OrderEventType.REJECTED,
-                                side=Side.BUY.value,
-                                qty=0.0,
-                                price=None,
-                                status="REJECTED",
-                                reason_code=ReasonCode.RISK_BUDGET_REJECT.value,
-                                reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
-                            )
+                        pos = get_position(db, symbol)
+                        base_qty = float(pos["base_qty"]) if pos else 0.0
+                        avg_entry = float(pos["avg_entry_price"]) if pos and pos["avg_entry_price"] is not None else None
 
-                        log_action(logger, "RISK_BUDGET_REJECT", trace_id=trace_id, symbol=symbol,
-                                   reason_code=ReasonCode.RISK_BUDGET_REJECT.value, reason=risk_note,
-                                   ai_score=ai_score, leverage=lev, stop_dist_pct=stop_dist_pct,
-                                   client_order_id=client_order_id)
-                        summary_kv = build_trade_summary(
-                            event="RISK_REJECT",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="BUY",
-                            leverage=lev,
-                            ai_score=ai_score,
-                            stop_dist_pct=stop_dist_pct,
-                            reason_code=ReasonCode.RISK_BUDGET_REJECT,
-                            reason=risk_note,
-                            client_order_id=client_order_id,
-                        )
-                        send_trade_alert(telegram, title="开仓被风控拒绝", summary_kv=summary_kv, payload={"note": risk_note})
-                        continue
-                        if int(lev2) != int(lev):
-                            lev = int(lev2)
-                            append_order_event(
-                                db,
-                                trace_id=trace_id,
-                                service=SERVICE,
-                                exchange=exchange,
-                                symbol=symbol,
-                                client_order_id=None,
-                                exchange_order_id=None,
-                                event_type=OrderEventType.CREATED,
-                                side=Side.BUY.value,
-                                qty=0.0,
-                                price=None,
-                                status="ADJUST",
-                                reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value,
-                                reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
-                            )
-
-                        log_action(logger, "RISK_BUDGET_ADJUST", trace_id=trace_id, symbol=symbol,
-                                   reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value, reason=risk_note,
-                                   ai_score=ai_score, leverage_before=lev, leverage_after=lev2,
-                                   stop_dist_pct=stop_dist_pct, client_order_id=client_order_id)
-
-
-                        # 你要求的口径：MIN_ORDER_USDT 是“实际保证金(USDT)”，而不是名义仓位。
-                        # 名义价值(notional) ≈ 价格 * qty ≈ 保证金 * 杠杆。
-                        # 因此最小下单 qty 需要按 notional_min = min_margin * leverage 反推。
-                        qty = min_qty_from_min_margin_usdt(runtime_cfg.min_order_usdt, last_price, lev, precision=6)
-                        if qty <= 0:
-                            continue
-
-                        # 设置逐仓杠杆（Bybit / Binance 合约）
-                        if hasattr(ex, "set_leverage_and_margin_mode"):
-                            ex.set_leverage_and_margin_mode(symbol=symbol, leverage=lev)
-
-                        client_order_id = make_client_order_id(
-                            "buy",
-                            symbol,
-                            interval_minutes=settings.interval_minutes,
-                            kline_open_time_ms=int(latest["open_time_ms"]),
-                            trace_id=trace_id,
-                        )
-
-                        # V8.3 Setup B decision (needs prev cache for squeeze/mom flip)
-                        ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
-                        should_buy, open_reason_code, open_reason = setup_b_decision(
-                            latest,
-                            prev,
-                            ai_score=ai_score,
-                            settings=settings,
-                            runtime_cfg=runtime_cfg,
-                        )
-                        if not should_buy:
-                            # 记录为什么没有下单（仅在DEBUG级别或定期记录，避免日志过多）
-                            log_action(
-                                logger,
-                                action="SETUP_B_REJECT",
-                                trace_id=trace_id,
-                                reason_code=open_reason_code.value,
-                                reason=open_reason,
-                                symbol=symbol,
-                                ai_score=ai_score,
-                                client_order_id=None,
-                            )
-                            continue
-
-                        stop_dist_pct = float(runtime_cfg.hard_stop_loss_pct)
-
-                        stop_price_init = float(last_price) * (1.0 - stop_dist_pct)
-                        open_reason = f"Setup B BUY; robot={round(float(score),2)}; ai_prob={round(float(ai_prob),4) if ai_prob is not None else None}; combined={round(float(combined_score),2)}"
-
-                        trade_id = _open_trade_log(
-                            db,
-                            trace_id=trace_id,
-                            symbol=symbol,
-                            qty=float(qty),
-                            actor=SERVICE,
-                            leverage=int(lev),
-                            stop_dist_pct=float(stop_dist_pct),
-                            stop_price=float(stop_price_init),
-                            client_order_id=client_order_id,
-                            robot_score=float(score),
-                            ai_prob=float(ai_prob) if ai_prob is not None else None,
-                            open_reason_code=open_reason_code.value,
-                            open_reason=open_reason,
-                            features_bundle=feat_bundle if isinstance(feat_bundle, dict) else {},
-                        )
-                        metrics.trades_open_total.labels(SERVICE, symbol).inc()
-
-                        append_order_event(
-                            db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                            client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
-                            side=Side.BUY.value, qty=qty, price=None, status="CREATED",
-                            reason_code=open_reason_code,
-                            reason=open_reason,
-                            payload={
-                                "latest": latest,
-                                "robot_score": score,
-                                "ai_prob": ai_prob,
-                                "combined_score": combined_score,
-                                "trade_id": trade_id,
-                                "stop_dist_pct": stop_dist_pct,
-                                "stop_price": stop_price_init,
-                                "leverage": lev,
-                                "min_margin_usdt": runtime_cfg.min_order_usdt,
-                                "notional_min_usdt": round(float(runtime_cfg.min_order_usdt) * float(lev), 4),
-                                "qty": qty,
-                                "last_price": last_price,
-                            }
-                        )
-                        # Telegram：下单已提交（避免只在成交后才告警，导致不知道是否已经挂/成交）
-                        summary_kv = build_trade_summary(
-                            event="BUY_SUBMITTED",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="BUY",
-                            qty=qty,
-                            price=last_price,
-                            leverage=lev,
-                            ai_score=ai_score,
-                            stop_price=stop_price_init,
-                            stop_dist_pct=stop_dist_pct,
-                            reason_code=open_reason_code,
-                            reason=open_reason,
-                            client_order_id=client_order_id,
-                            status="SUBMITTING",
-                            extra={"trade_id": trade_id},
-                        )
-                        send_trade_alert(
-                            telegram,
-                            title="开仓下单已提交",
-                            summary_kv=summary_kv,
-                            payload={
-                                "client_order_id": client_order_id,
-                                "symbol": symbol,
-                                "side": "BUY",
-                                "qty": float(qty),
-                                "last_price": float(last_price),
-                                "expected_stop_price": float(stop_price_init),
-                                "leverage": int(lev),
-                                "reason_code": open_reason_code.value if hasattr(open_reason_code, "value") else str(open_reason_code),
-                                "reason": open_reason,
-                            },
-                        )
-                        res = ex.place_market_order(symbol=symbol, side="BUY", qty=qty, client_order_id=client_order_id)
-                        append_order_event(
-                            db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                            client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
-                            event_type=_event_type_from_status(res.status),
-                            side=Side.BUY.value, qty=qty, price=res.avg_price, status=res.status,
-                            reason_code=open_reason_code, reason=open_reason, payload={"exchange": res.raw or {}, "open_reason": open_reason, "open_reason_code": open_reason_code.value}
-
-                        )
-                        entry_price = res.avg_price if res.avg_price is not None else last_price
-                        stop_price_final = float(entry_price) * (1.0 - float(stop_dist_pct))
-                        _update_trade_after_entry_fill(
-                            db,
-                            trade_id=int(trade_id),
-                            entry_price=float(entry_price) if entry_price is not None else None,
-                            exchange_order_id=res.exchange_order_id,
-                            stop_price=float(stop_price_final),
-                        )
-                        stop_client_order_id = None
-                        stop_exchange_order_id = None
-                        if runtime_cfg.use_protective_stop_order and settings.exchange != "paper":
-                            stop_client_order_id, stop_exchange_order_id = _arm_protective_stop_with_retry(
+                        # --- 交易所保护止损单：轮询 + 异常分支（拒绝/过期/取消）自动重挂或降级 ---
+                        if base_qty > 0 and bool(runtime_cfg.use_protective_stop_order) and settings.exchange != "paper":
+                            meta_before = _parse_json_maybe(pos.get("meta_json") if pos else None)
+                            closed_by_stop, meta_after = _ensure_protective_stop(
                                 exchange=ex,
                                 db=db,
                                 metrics=metrics,
@@ -2381,366 +1836,911 @@ def main():
                                 settings=settings,
                                 runtime_cfg=runtime_cfg,
                                 symbol=symbol,
-                                qty=float(qty),
-                                stop_price=float(stop_price_final),
+                                base_qty=float(base_qty),
+                                avg_entry=avg_entry,
+                                pos_row=pos,
                                 trace_id=trace_id,
-                                trade_id=int(trade_id),
-                                base_open_client_order_id=client_order_id,
-                                action="ARM",
-                                seq=1,
                             )
-                        meta_enter = {
-                            "trace_id": trace_id,
-                            "note": "entered",
-                            "robot_score": float(score),
-                            "leverage": int(lev),
-                            "trade_id": int(trade_id),
-                            "open_client_order_id": client_order_id,
-                            "entry_client_order_id": client_order_id,
-                            "stop_dist_pct": float(stop_dist_pct),
-                            "stop_price": float(stop_price_final),
-                            "stop_client_order_id": stop_client_order_id,
-                            "stop_exchange_order_id": stop_exchange_order_id,
-                        }
-                        save_position(db, symbol, float(qty), float(entry_price), meta_enter)
-                        open_cnt += 1
+                            # 仅当 meta 有变化时写快照（避免每轮都写）
+                            try:
+                                if meta_after != meta_before:
+                                    save_position(db, symbol, float(base_qty), float(avg_entry) if avg_entry is not None else None, meta_after)
+                            except Exception:
+                                pass
 
-                        summary_kv = build_trade_summary(
-                            event="BUY_FILLED",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="BUY",
-                            qty=qty,
-                            price=entry_price,
-                            leverage=lev,
-                            ai_score=ai_score,
-                            stop_price=stop_price_final,
-                            stop_dist_pct=stop_dist_pct,
-                            reason_code=open_reason_code,
-                            reason=open_reason,
-                            client_order_id=client_order_id,
-                            exchange_order_id=res.exchange_order_id,
-                            stop_client_order_id=stop_client_order_id,
-                            stop_exchange_order_id=stop_exchange_order_id,
-                        )
-                        send_trade_alert(
-                            telegram,
-                            title="开仓成交",
-                            summary_kv=summary_kv,
-                            payload={
-                                "client_order_id": client_order_id,
-                                "exchange_order_id": res.exchange_order_id,
-                                "avg_price": res.avg_price,
-                                "fee_usdt": res.fee_usdt,
-                                "pnl_usdt": res.pnl_usdt,
-                                "robot_score": score,
-                                "leverage": lev,
-                                "reason_code": open_reason_code.value if hasattr(open_reason_code, 'value') else str(open_reason_code),
-                                "reason": open_reason,
-                                "raw": res.raw or {},
-                            },
-                        )
-                        log_action(
-                            logger,
-                            "BUY_FILLED",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="BUY",
-                            qty=qty,
-                            price=entry_price,
-                            leverage=lev,
-                            ai_score=ai_score,
-                            stop_price=stop_price_final,
-                            stop_dist_pct=stop_dist_pct,
-                            client_order_id=client_order_id,
-                            exchange_order_id=res.exchange_order_id,
-                            reason_code=open_reason_code.value if hasattr(open_reason_code, 'value') else str(open_reason_code),
-                            reason=open_reason,
-                        )
-                        metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "BUY").inc()
+                            if closed_by_stop:
+                                # 止损单已成交 -> 更新本地仓位为 0，关闭 trade
+                                stop_fill = meta_after.pop("_stop_fill", {}) if isinstance(meta_after, dict) else {}
+                                exit_price = stop_fill.get("avg_price") or meta_after.get("stop_price") or avg_entry
+                                trade_id2 = _find_open_trade_id(db, symbol, meta_after if isinstance(meta_after, dict) else {})
+                                save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "protective_stop_filled", "trade_id": trade_id2})
+                                if trade_id2 > 0:
+                                    _close_trade_and_train(
+                                        db,
+                                        settings,
+                                        metrics,
+                                        _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
+                                        trade_id=trade_id2,
+                                        symbol=symbol,
+                                        qty=float(base_qty),
+                                        exit_price=float(exit_price) if exit_price is not None else None,
+                                        pnl_usdt=stop_fill.get("pnl_usdt"),
+                                        close_reason_code=ReasonCode.STOP_LOSS.value,
+                                        close_reason="Protective stop filled (exchange)",
+                                        trace_id=trace_id,
+                                        runtime_cfg=runtime_cfg,
+                                    )
+                                open_cnt = max(0, open_cnt - 1)
+                                stop_p = None
+                                try:
+                                    stop_p = float(meta_after.get("stop_price") or 0.0) if isinstance(meta_after, dict) else None
+                                except Exception:
+                                    stop_p = None
+                                summary_kv = build_trade_summary(
+                                    event="PROTECTIVE_STOP_FILLED",
+                                    trace_id=trace_id,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    side="SELL",
+                                    qty=base_qty,
+                                    price=exit_price,
+                                    stop_price=stop_p,
+                                    reason_code=ReasonCode.STOP_LOSS,
+                                    reason="Protective stop filled (exchange)",
+                                    extra={"pnl_usdt": stop_fill.get("pnl_usdt")},
+                                )
+                                send_trade_alert(
+                                    telegram,
+                                    title="交易所止损单成交",
+                                    summary_kv=summary_kv,
+                                    payload={"stop_fill": stop_fill},
+                                )
+                                log_action(
+                                    logger,
+                                    "PROTECTIVE_STOP_FILLED",
+                                    trace_id=trace_id,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    side="SELL",
+                                    qty=base_qty,
+                                    price=exit_price,
+                                    stop_price=stop_p,
+                                    reason_code=ReasonCode.STOP_LOSS.value,
+                                    reason="Protective stop filled (exchange)",
+                                    pnl_usdt=stop_fill.get("pnl_usdt"),
+                                )
+                                try:
+                                    metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "STOP_LOSS").inc()
+                                except Exception:
+                                    pass
+                                continue
 
-                    elif sig == "SELL" and base_qty > 0:
-                        meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
-                        meta["base_qty"] = float(base_qty)
-                        if runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get("stop_client_order_id"):
-                            _cancel_protective_stop(exchange=ex, db=db, symbol=symbol, trace_id=trace_id, meta=meta)
-                        qty = base_qty
-                        score = compute_robot_score(latest, signal="SELL")
-                        lev = leverage_from_score(settings, score)
-                        # V8.3 risk budget hard-constraint
-                        equity_usdt = get_equity_usdt(ex, settings, runtime_cfg)
-                        ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
-                        base_margin_usdt = compute_base_margin_usdt(equity_usdt=equity_usdt, ai_score=ai_score, settings=settings)
-                        ok_risk, lev2, risk_note = enforce_risk_budget(
-                            equity_usdt=equity_usdt,
-                            base_margin_usdt=base_margin_usdt,
-                            leverage=int(lev),
-                            stop_dist_pct=float(runtime_cfg.hard_stop_loss_pct),
-                            settings=settings,
-                            runtime_cfg=runtime_cfg,
-                        )
-                        if not ok_risk:
-                            append_order_event(
-                                db,
-                                trace_id=trace_id,
-                                service=SERVICE,
-                                exchange=exchange,
-                                symbol=symbol,
-                                client_order_id=None,
-                                exchange_order_id=None,
-                                event_type=OrderEventType.REJECTED,
-                                side=Side.BUY.value,
-                                qty=0.0,
-                                price=None,
-                                status="REJECTED",
-                                reason_code=ReasonCode.RISK_BUDGET_REJECT.value,
-                                reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
-                            )
+                        # --- 紧急退出：对所有交易对生效 ---
+                        if bool(runtime_cfg.emergency_exit):
+                            if base_qty > 0:
+                                client_order_id = make_client_order_id(
+                                    "exit",
+                                    symbol,
+                                    interval_minutes=settings.interval_minutes,
+                                    kline_open_time_ms=int(latest["open_time_ms"]),
+                                    trace_id=trace_id,
+                                )
+                                append_order_event(
+                                    db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                    client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
+                                    side=Side.SELL.value, qty=base_qty, price=None, status="CREATED",
+                                    reason_code=ReasonCode.EMERGENCY_EXIT, reason="Emergency exit requested", payload={}
+                                )
+                                meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
+                                meta["base_qty"] = float(base_qty)
+                                if runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get("stop_client_order_id"):
+                                    _cancel_protective_stop(exchange=ex, db=db, symbol=symbol, trace_id=trace_id, meta=meta)
+                                send_system_alert(
+                                    telegram,
+                                    title="紧急退出下单已提交",
+                                    summary_kv=build_system_summary(
+                                        event="EMERGENCY_EXIT_SUBMITTED",
+                                        trace_id=trace_id,
+                                        exchange=exchange,
+                                        level="WARN",
+                                        extra={
+                                            "symbol": symbol,
+                                            "side": "SELL",
+                                            "qty": float(base_qty),
+                                            "last_price": float(last_price),
+                                            "client_order_id": client_order_id,
+                                        },
+                                    ),
+                                    payload={
+                                        "symbol": symbol,
+                                        "side": "SELL",
+                                        "qty": float(base_qty),
+                                        "last_price": float(last_price),
+                                        "client_order_id": client_order_id,
+                                    },
+                                )
+                                summary_kv = build_trade_summary(
+                                    event="STOP_LOSS_SUBMITTED",
+                                    trace_id=trace_id,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    side="SELL",
+                                    qty=base_qty,
+                                    price=last_price,
+                                    stop_price=stop_price,
+                                    reason_code=ReasonCode.STOP_LOSS,
+                                    reason=f"Hard stop loss submit: last={last_price} <= stop={stop_price}",
+                                    client_order_id=client_order_id,
+                                    status="SUBMITTING",
+                                )
+                                send_trade_alert(
+                                    telegram,
+                                    title="止损下单已提交",
+                                    summary_kv=summary_kv,
+                                    payload={
+                                        "client_order_id": client_order_id,
+                                        "symbol": symbol,
+                                        "side": "SELL",
+                                        "qty": float(base_qty),
+                                        "last_price": float(last_price),
+                                        "stop_price": float(stop_price),
+                                    },
+                                )
+                                res = ex.place_market_order(symbol=symbol, side="SELL", qty=base_qty, client_order_id=client_order_id)
+                                append_order_event(
+                                    db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                    client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
+                                    event_type=_event_type_from_status(res.status),
+                                    side=Side.SELL.value, qty=base_qty, price=res.avg_price, status=res.status,
+                                    reason_code=ReasonCode.EMERGENCY_EXIT, reason="Emergency exit executed", payload=res.raw or {}
+                                )
+                                meta2 = _parse_json_maybe(pos.get("meta_json") if pos else None)
+                                trade_id2 = _find_open_trade_id(db, symbol, meta2)
+                                save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "emergency_exit", "trade_id": trade_id2})
+                                if trade_id2 > 0:
+                                    _close_trade_and_train(
+                                        db,
+                                        settings,
+                                        metrics,
+                                        _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
+                                        trade_id=trade_id2,
+                                        symbol=symbol,
+                                        qty=float(base_qty),
+                                        exit_price=res.avg_price,
+                                        pnl_usdt=res.pnl_usdt,
+                                        close_reason_code=ReasonCode.EMERGENCY_EXIT.value,
+                                        close_reason="Emergency exit executed",
+                                        trace_id=trace_id,
+                                        runtime_cfg=runtime_cfg,
+                                    )
+                                open_cnt = max(0, open_cnt - 1)
+                                send_system_alert(
+                                    telegram,
+                                    title="紧急退出已执行",
+                                    summary_kv=build_system_summary(
+                                        event="EMERGENCY_EXIT_EXECUTED",
+                                        trace_id=trace_id,
+                                        exchange=exchange,
+                                        level="INFO",
+                                        extra={
+                                            "symbol": symbol,
+                                            "side": "SELL",
+                                            "qty": base_qty,
+                                            "price": res.avg_price,
+                                            "fee_usdt": res.fee_usdt,
+                                            "pnl_usdt": res.pnl_usdt,
+                                        },
+                                    ),
+                                    payload={
+                                        "client_order_id": client_order_id,
+                                        "exchange_order_id": res.exchange_order_id,
+                                        "avg_price": res.avg_price,
+                                        "fee_usdt": res.fee_usdt,
+                                        "pnl_usdt": res.pnl_usdt,
+                                    },
+                                )
 
-                        log_action(logger, "RISK_BUDGET_REJECT", trace_id=trace_id, symbol=symbol,
-                                   reason_code=ReasonCode.RISK_BUDGET_REJECT.value, reason=risk_note,
-                                   ai_score=ai_score, leverage=lev, stop_dist_pct=stop_dist_pct,
-                                   client_order_id=client_order_id)
-                        summary_kv = build_trade_summary(
-                            event="RISK_REJECT",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="BUY",
-                            leverage=lev,
-                            ai_score=ai_score,
-                            stop_dist_pct=stop_dist_pct,
-                            reason_code=ReasonCode.RISK_BUDGET_REJECT,
-                            reason=risk_note,
-                            client_order_id=client_order_id,
-                        )
-                        send_trade_alert(telegram, title="开仓被风控拒绝", summary_kv=summary_kv, payload={"note": risk_note})
-                        continue
-                        if int(lev2) != int(lev):
-                            lev = int(lev2)
-                            append_order_event(
-                                db,
-                                trace_id=trace_id,
-                                service=SERVICE,
-                                exchange=exchange,
-                                symbol=symbol,
-                                client_order_id=None,
-                                exchange_order_id=None,
-                                event_type=OrderEventType.CREATED,
-                                side=Side.BUY.value,
-                                qty=0.0,
-                                price=None,
-                                status="ADJUST",
-                                reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value,
-                                reason=risk_note,
-                                payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
-                            )
+                            # 当所有币对都检查完后再清掉 EMERGENCY_EXIT
+                            continue
 
-                        log_action(logger, "RISK_BUDGET_ADJUST", trace_id=trace_id, symbol=symbol,
-                                   reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value, reason=risk_note,
-                                   ai_score=ai_score, leverage_before=lev, leverage_after=lev2,
-                                   stop_dist_pct=stop_dist_pct, client_order_id=client_order_id)
+                        # --- 硬止损（逐仓合约） ---
+                        if base_qty > 0 and avg_entry is not None:
+                            meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
+                            stop_dist_pct = float(meta.get('stop_dist_pct') or runtime_cfg.hard_stop_loss_pct)
+                            stop_price = float(meta.get('stop_price') or (avg_entry * (1.0 - stop_dist_pct)))
+                            if last_price <= stop_price and not (runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get('stop_client_order_id')):
+                                client_order_id = make_client_order_id(
+                                    "sl",
+                                    symbol,
+                                    interval_minutes=settings.interval_minutes,
+                                    kline_open_time_ms=int(latest["open_time_ms"]),
+                                    trace_id=trace_id,
+                                )
+                                append_order_event(
+                                    db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                    client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
+                                    side=Side.SELL.value, qty=base_qty, price=None, status="CREATED",
+                                    reason_code=ReasonCode.STOP_LOSS,
+                                    reason=f"Hard stop loss: last={last_price} <= stop={stop_price}",
+                                    payload={"last_price": last_price, "stop_price": stop_price}
+                                )
+                                res = ex.place_market_order(symbol=symbol, side="SELL", qty=base_qty, client_order_id=client_order_id)
+                                append_order_event(
+                                    db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                    client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
+                                    event_type=_event_type_from_status(res.status),
+                                    side=Side.SELL.value, qty=base_qty, price=res.avg_price, status=res.status,
+                                    reason_code=ReasonCode.STOP_LOSS, reason="Stop loss executed", payload=res.raw or {}
+                                )
+                                meta2 = _parse_json_maybe(pos.get("meta_json") if pos else None)
+                                trade_id2 = _find_open_trade_id(db, symbol, meta2)
+                                save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "stop_loss", "trade_id": trade_id2})
+                                if trade_id2 > 0:
+                                    _close_trade_and_train(
+                                        db,
+                                        settings,
+                                        metrics,
+                                        _load_ai_model(db, settings, runtime_cfg) if runtime_cfg.ai_enabled else None,
+                                        trade_id=trade_id2,
+                                        symbol=symbol,
+                                        qty=float(base_qty),
+                                        exit_price=res.avg_price,
+                                        pnl_usdt=res.pnl_usdt,
+                                        close_reason_code=ReasonCode.STOP_LOSS.value,
+                                        close_reason="Hard stop loss triggered",
+                                        trace_id=trace_id,
+                                        runtime_cfg=runtime_cfg,
+                                    )
+                                open_cnt = max(0, open_cnt - 1)
+                                summary_kv = build_trade_summary(
+                                    event="STOP_LOSS",
+                                    trace_id=trace_id,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    side="SELL",
+                                    qty=base_qty,
+                                    price=res.avg_price,
+                                    stop_price=stop_price,
+                                    reason_code=ReasonCode.STOP_LOSS,
+                                    reason="Stop loss triggered",
+                                    client_order_id=client_order_id,
+                                    exchange_order_id=res.exchange_order_id,
+                                    extra={"last_price": round(float(last_price), 4), "fee_usdt": res.fee_usdt, "pnl_usdt": res.pnl_usdt},
+                                )
+                                send_trade_alert(
+                                    telegram,
+                                    title="触发止损",
+                                    summary_kv=summary_kv,
+                                    payload={
+                                        "client_order_id": client_order_id,
+                                        "exchange_order_id": res.exchange_order_id,
+                                        "avg_price": res.avg_price,
+                                        "fee_usdt": res.fee_usdt,
+                                        "pnl_usdt": res.pnl_usdt,
+                                        "raw": res.raw or {},
+                                    },
+                                )
+                                log_action(
+                                    logger,
+                                    "STOP_LOSS",
+                                    trace_id=trace_id,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    side="SELL",
+                                    qty=base_qty,
+                                    price=res.avg_price,
+                                    stop_price=stop_price,
+                                    client_order_id=client_order_id,
+                                    exchange_order_id=res.exchange_order_id,
+                                    reason_code=ReasonCode.STOP_LOSS.value,
+                                    reason="Stop loss triggered",
+                                    pnl_usdt=res.pnl_usdt,
+                                )
+                                metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "STOP_LOSS").inc()
+                                continue
 
-                        if hasattr(ex, "set_leverage_and_margin_mode"):
-                            ex.set_leverage_and_margin_mode(symbol=symbol, leverage=lev)
+                        sig = setup_b_signal(latest)
+                        if sig == "BUY" and base_qty <= 0:
+                            # 多币对选币开仓：仅允许本轮被 AI 选中的币对执行开仓
+                            if symbol not in selected_open_symbols:
+                                continue
+                            # 全局最多 N 单（跨交易对）
+                            if open_cnt >= int(runtime_cfg.max_concurrent_positions):
+                                continue
 
-                        client_order_id = make_client_order_id(
-                            "sell",
-                            symbol,
-                            interval_minutes=settings.interval_minutes,
-                            kline_open_time_ms=int(latest["open_time_ms"]),
-                            trace_id=trace_id,
-                        )
-                        append_order_event(
-                            db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                            client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
-                            side=Side.SELL.value, qty=qty, price=None, status="CREATED",
-                            reason_code=ReasonCode.STRATEGY_SIGNAL,
-                            reason="Setup B SELL",
-                            payload={"latest": latest, "robot_score": score, "leverage": lev}
-                        )
-                        summary_kv = build_trade_summary(
-                            event="SELL_SUBMITTED",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="SELL",
-                            qty=qty,
-                            price=last_price,
-                            leverage=lev,
-                            reason_code=ReasonCode.STRATEGY_EXIT,
-                            reason="Setup B SELL",
-                            client_order_id=client_order_id,
-                            status="SUBMITTING",
-                        )
-                        send_trade_alert(
-                            telegram,
-                            title="平仓下单已提交",
-                            summary_kv=summary_kv,
-                            payload={
-                                "client_order_id": client_order_id,
-                                "symbol": symbol,
-                                "side": "SELL",
-                                "qty": float(qty),
-                                "last_price": float(last_price),
-                                "leverage": int(lev),
-                                "reason_code": ReasonCode.STRATEGY_EXIT.value,
-                                "reason": "Setup B SELL",
-                            },
-                        )
-                        res = ex.place_market_order(symbol=symbol, side="SELL", qty=qty, client_order_id=client_order_id)
-                        append_order_event(
-                            db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
-                            client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
-                            event_type=_event_type_from_status(res.status),
-                            side=Side.SELL.value, qty=qty, price=res.avg_price, status=res.status,
-                            reason_code=open_reason_code, reason=open_reason, payload={"exchange": res.raw or {}, "open_reason": open_reason, "open_reason_code": open_reason_code.value}
-                        )
-                        meta2 = _parse_json_maybe(pos.get("meta_json") if pos else None)
-                        trade_id2 = _find_open_trade_id(db, symbol, meta2)
-                        save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "exited", "trade_id": trade_id2, "robot_score": score, "leverage": lev})
-                        close_code = ReasonCode.STRATEGY_EXIT.value
-                        if settings.take_profit_reason_on_positive_pnl and (res.pnl_usdt is not None and float(res.pnl_usdt) > 0):
-                            close_code = ReasonCode.TAKE_PROFIT.value
-                        if trade_id2 > 0:
-                            _close_trade_and_train(
-                                db,
-                                settings,
-                                metrics,
-                                _load_ai_model(db, settings) if runtime_cfg.ai_enabled else None,
-                                trade_id=trade_id2,
-                                symbol=symbol,
-                                qty=float(qty),
-                                exit_price=res.avg_price,
-                                pnl_usdt=res.pnl_usdt,
-                                close_reason_code=close_code,
-                                close_reason="Setup B SELL",
-                                trace_id=trace_id,
+                            # 动态杠杆：10~20 倍（由机器人评分决定）
+                            meta_open = selected_open_meta.get(symbol, {})
+                            score = float(meta_open.get("robot_score") or compute_robot_score(latest, signal="BUY"))
+                            ai_prob = meta_open.get("ai_prob")
+                            combined_score = float(meta_open.get("combined_score") or score)
+                            feat_bundle = meta_open.get("features_bundle") or {}
+                            lev = leverage_from_score(settings, score)
+                            # V8.3 risk budget hard-constraint
+                            equity_usdt = get_equity_usdt(ex, settings, runtime_cfg)
+                            ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
+                            base_margin_usdt = compute_base_margin_usdt(equity_usdt=equity_usdt, ai_score=ai_score, settings=settings)
+                            ok_risk, lev2, risk_note = enforce_risk_budget(
+                                equity_usdt=equity_usdt,
+                                base_margin_usdt=base_margin_usdt,
+                                leverage=int(lev),
+                                stop_dist_pct=float(runtime_cfg.hard_stop_loss_pct),
+                                settings=settings,
                                 runtime_cfg=runtime_cfg,
                             )
-                        open_cnt = max(0, open_cnt - 1)
+                            if not ok_risk:
+                                append_order_event(
+                                    db,
+                                    trace_id=trace_id,
+                                    service=SERVICE,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    client_order_id=None,
+                                    exchange_order_id=None,
+                                    event_type=OrderEventType.REJECTED,
+                                    side=Side.BUY.value,
+                                    qty=0.0,
+                                    price=None,
+                                    status="REJECTED",
+                                    reason_code=ReasonCode.RISK_BUDGET_REJECT.value,
+                                    reason=risk_note,
+                                    payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
+                                )
 
-                        summary_kv = build_trade_summary(
-                            event="SELL_FILLED",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="SELL",
-                            qty=qty,
-                            price=res.avg_price,
-                            leverage=lev,
-                            reason_code=close_code,
-                            reason="Setup B SELL",
-                            client_order_id=client_order_id,
-                            exchange_order_id=res.exchange_order_id,
-                            extra={"robot_score": round(float(score), 2), "fee_usdt": res.fee_usdt, "pnl_usdt": res.pnl_usdt},
-                        )
-                        send_trade_alert(
+                            log_action(logger, "RISK_BUDGET_REJECT", trace_id=trace_id, symbol=symbol,
+                                       reason_code=ReasonCode.RISK_BUDGET_REJECT.value, reason=risk_note,
+                                       ai_score=ai_score, leverage=lev, stop_dist_pct=stop_dist_pct,
+                                       client_order_id=client_order_id)
+                            summary_kv = build_trade_summary(
+                                event="RISK_REJECT",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="BUY",
+                                leverage=lev,
+                                ai_score=ai_score,
+                                stop_dist_pct=stop_dist_pct,
+                                reason_code=ReasonCode.RISK_BUDGET_REJECT,
+                                reason=risk_note,
+                                client_order_id=client_order_id,
+                            )
+                            send_trade_alert(telegram, title="开仓被风控拒绝", summary_kv=summary_kv, payload={"note": risk_note})
+                            continue
+                            if int(lev2) != int(lev):
+                                lev = int(lev2)
+                                append_order_event(
+                                    db,
+                                    trace_id=trace_id,
+                                    service=SERVICE,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    client_order_id=None,
+                                    exchange_order_id=None,
+                                    event_type=OrderEventType.CREATED,
+                                    side=Side.BUY.value,
+                                    qty=0.0,
+                                    price=None,
+                                    status="ADJUST",
+                                    reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value,
+                                    reason=risk_note,
+                                    payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
+                                )
+
+                            log_action(logger, "RISK_BUDGET_ADJUST", trace_id=trace_id, symbol=symbol,
+                                       reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value, reason=risk_note,
+                                       ai_score=ai_score, leverage_before=lev, leverage_after=lev2,
+                                       stop_dist_pct=stop_dist_pct, client_order_id=client_order_id)
+
+
+                            # 你要求的口径：MIN_ORDER_USDT 是“实际保证金(USDT)”，而不是名义仓位。
+                            # 名义价值(notional) ≈ 价格 * qty ≈ 保证金 * 杠杆。
+                            # 因此最小下单 qty 需要按 notional_min = min_margin * leverage 反推。
+                            qty = min_qty_from_min_margin_usdt(runtime_cfg.min_order_usdt, last_price, lev, precision=6)
+                            if qty <= 0:
+                                continue
+
+                            # 设置逐仓杠杆（Bybit / Binance 合约）
+                            if hasattr(ex, "set_leverage_and_margin_mode"):
+                                ex.set_leverage_and_margin_mode(symbol=symbol, leverage=lev)
+
+                            client_order_id = make_client_order_id(
+                                "buy",
+                                symbol,
+                                interval_minutes=settings.interval_minutes,
+                                kline_open_time_ms=int(latest["open_time_ms"]),
+                                trace_id=trace_id,
+                            )
+
+                            # V8.3 Setup B decision (needs prev cache for squeeze/mom flip)
+                            ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
+                            should_buy, open_reason_code, open_reason = setup_b_decision(
+                                latest,
+                                prev,
+                                ai_score=ai_score,
+                                settings=settings,
+                                runtime_cfg=runtime_cfg,
+                            )
+                            if not should_buy:
+                                # 记录为什么没有下单（仅在DEBUG级别或定期记录，避免日志过多）
+                                log_action(
+                                    logger,
+                                    action="SETUP_B_REJECT",
+                                    trace_id=trace_id,
+                                    reason_code=open_reason_code.value,
+                                    reason=open_reason,
+                                    symbol=symbol,
+                                    ai_score=ai_score,
+                                    client_order_id=None,
+                                )
+                                continue
+
+                            stop_dist_pct = float(runtime_cfg.hard_stop_loss_pct)
+
+                            stop_price_init = float(last_price) * (1.0 - stop_dist_pct)
+                            open_reason = f"Setup B BUY; robot={round(float(score),2)}; ai_prob={round(float(ai_prob),4) if ai_prob is not None else None}; combined={round(float(combined_score),2)}"
+
+                            trade_id = _open_trade_log(
+                                db,
+                                trace_id=trace_id,
+                                symbol=symbol,
+                                qty=float(qty),
+                                actor=SERVICE,
+                                leverage=int(lev),
+                                stop_dist_pct=float(stop_dist_pct),
+                                stop_price=float(stop_price_init),
+                                client_order_id=client_order_id,
+                                robot_score=float(score),
+                                ai_prob=float(ai_prob) if ai_prob is not None else None,
+                                open_reason_code=open_reason_code.value,
+                                open_reason=open_reason,
+                                features_bundle=feat_bundle if isinstance(feat_bundle, dict) else {},
+                            )
+                            metrics.trades_open_total.labels(SERVICE, symbol).inc()
+
+                            append_order_event(
+                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
+                                side=Side.BUY.value, qty=qty, price=None, status="CREATED",
+                                reason_code=open_reason_code,
+                                reason=open_reason,
+                                payload={
+                                    "latest": latest,
+                                    "robot_score": score,
+                                    "ai_prob": ai_prob,
+                                    "combined_score": combined_score,
+                                    "trade_id": trade_id,
+                                    "stop_dist_pct": stop_dist_pct,
+                                    "stop_price": stop_price_init,
+                                    "leverage": lev,
+                                    "min_margin_usdt": runtime_cfg.min_order_usdt,
+                                    "notional_min_usdt": round(float(runtime_cfg.min_order_usdt) * float(lev), 4),
+                                    "qty": qty,
+                                    "last_price": last_price,
+                                }
+                            )
+                            # Telegram：下单已提交（避免只在成交后才告警，导致不知道是否已经挂/成交）
+                            summary_kv = build_trade_summary(
+                                event="BUY_SUBMITTED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="BUY",
+                                qty=qty,
+                                price=last_price,
+                                leverage=lev,
+                                ai_score=ai_score,
+                                stop_price=stop_price_init,
+                                stop_dist_pct=stop_dist_pct,
+                                reason_code=open_reason_code,
+                                reason=open_reason,
+                                client_order_id=client_order_id,
+                                status="SUBMITTING",
+                                extra={"trade_id": trade_id},
+                            )
+                            send_trade_alert(
+                                telegram,
+                                title="开仓下单已提交",
+                                summary_kv=summary_kv,
+                                payload={
+                                    "client_order_id": client_order_id,
+                                    "symbol": symbol,
+                                    "side": "BUY",
+                                    "qty": float(qty),
+                                    "last_price": float(last_price),
+                                    "expected_stop_price": float(stop_price_init),
+                                    "leverage": int(lev),
+                                    "reason_code": open_reason_code.value if hasattr(open_reason_code, "value") else str(open_reason_code),
+                                    "reason": open_reason,
+                                },
+                            )
+                            res = ex.place_market_order(symbol=symbol, side="BUY", qty=qty, client_order_id=client_order_id)
+                            append_order_event(
+                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
+                                event_type=_event_type_from_status(res.status),
+                                side=Side.BUY.value, qty=qty, price=res.avg_price, status=res.status,
+                                reason_code=open_reason_code, reason=open_reason, payload={"exchange": res.raw or {}, "open_reason": open_reason, "open_reason_code": open_reason_code.value}
+
+                            )
+                            entry_price = res.avg_price if res.avg_price is not None else last_price
+                            stop_price_final = float(entry_price) * (1.0 - float(stop_dist_pct))
+                            _update_trade_after_entry_fill(
+                                db,
+                                trade_id=int(trade_id),
+                                entry_price=float(entry_price) if entry_price is not None else None,
+                                exchange_order_id=res.exchange_order_id,
+                                stop_price=float(stop_price_final),
+                            )
+                            stop_client_order_id = None
+                            stop_exchange_order_id = None
+                            if runtime_cfg.use_protective_stop_order and settings.exchange != "paper":
+                                stop_client_order_id, stop_exchange_order_id = _arm_protective_stop_with_retry(
+                                    exchange=ex,
+                                    db=db,
+                                    metrics=metrics,
+                                    telegram=telegram,
+                                    settings=settings,
+                                    runtime_cfg=runtime_cfg,
+                                    symbol=symbol,
+                                    qty=float(qty),
+                                    stop_price=float(stop_price_final),
+                                    trace_id=trace_id,
+                                    trade_id=int(trade_id),
+                                    base_open_client_order_id=client_order_id,
+                                    action="ARM",
+                                    seq=1,
+                                )
+                            meta_enter = {
+                                "trace_id": trace_id,
+                                "note": "entered",
+                                "robot_score": float(score),
+                                "leverage": int(lev),
+                                "trade_id": int(trade_id),
+                                "open_client_order_id": client_order_id,
+                                "entry_client_order_id": client_order_id,
+                                "stop_dist_pct": float(stop_dist_pct),
+                                "stop_price": float(stop_price_final),
+                                "stop_client_order_id": stop_client_order_id,
+                                "stop_exchange_order_id": stop_exchange_order_id,
+                            }
+                            save_position(db, symbol, float(qty), float(entry_price), meta_enter)
+                            open_cnt += 1
+
+                            summary_kv = build_trade_summary(
+                                event="BUY_FILLED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="BUY",
+                                qty=qty,
+                                price=entry_price,
+                                leverage=lev,
+                                ai_score=ai_score,
+                                stop_price=stop_price_final,
+                                stop_dist_pct=stop_dist_pct,
+                                reason_code=open_reason_code,
+                                reason=open_reason,
+                                client_order_id=client_order_id,
+                                exchange_order_id=res.exchange_order_id,
+                                stop_client_order_id=stop_client_order_id,
+                                stop_exchange_order_id=stop_exchange_order_id,
+                            )
+                            send_trade_alert(
+                                telegram,
+                                title="开仓成交",
+                                summary_kv=summary_kv,
+                                payload={
+                                    "client_order_id": client_order_id,
+                                    "exchange_order_id": res.exchange_order_id,
+                                    "avg_price": res.avg_price,
+                                    "fee_usdt": res.fee_usdt,
+                                    "pnl_usdt": res.pnl_usdt,
+                                    "robot_score": score,
+                                    "leverage": lev,
+                                    "reason_code": open_reason_code.value if hasattr(open_reason_code, 'value') else str(open_reason_code),
+                                    "reason": open_reason,
+                                    "raw": res.raw or {},
+                                },
+                            )
+                            log_action(
+                                logger,
+                                "BUY_FILLED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="BUY",
+                                qty=qty,
+                                price=entry_price,
+                                leverage=lev,
+                                ai_score=ai_score,
+                                stop_price=stop_price_final,
+                                stop_dist_pct=stop_dist_pct,
+                                client_order_id=client_order_id,
+                                exchange_order_id=res.exchange_order_id,
+                                reason_code=open_reason_code.value if hasattr(open_reason_code, 'value') else str(open_reason_code),
+                                reason=open_reason,
+                            )
+                            metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "BUY").inc()
+
+                        elif sig == "SELL" and base_qty > 0:
+                            meta = _parse_json_maybe(pos.get('meta_json') if pos else None)
+                            meta["base_qty"] = float(base_qty)
+                            if runtime_cfg.use_protective_stop_order and settings.exchange != "paper" and meta.get("stop_client_order_id"):
+                                _cancel_protective_stop(exchange=ex, db=db, symbol=symbol, trace_id=trace_id, meta=meta)
+                            qty = base_qty
+                            score = compute_robot_score(latest, signal="SELL")
+                            lev = leverage_from_score(settings, score)
+                            # V8.3 risk budget hard-constraint
+                            equity_usdt = get_equity_usdt(ex, settings, runtime_cfg)
+                            ai_score = float(ai_prob * 100.0) if ai_prob is not None else 50.0
+                            base_margin_usdt = compute_base_margin_usdt(equity_usdt=equity_usdt, ai_score=ai_score, settings=settings)
+                            ok_risk, lev2, risk_note = enforce_risk_budget(
+                                equity_usdt=equity_usdt,
+                                base_margin_usdt=base_margin_usdt,
+                                leverage=int(lev),
+                                stop_dist_pct=float(runtime_cfg.hard_stop_loss_pct),
+                                settings=settings,
+                                runtime_cfg=runtime_cfg,
+                            )
+                            if not ok_risk:
+                                append_order_event(
+                                    db,
+                                    trace_id=trace_id,
+                                    service=SERVICE,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    client_order_id=None,
+                                    exchange_order_id=None,
+                                    event_type=OrderEventType.REJECTED,
+                                    side=Side.BUY.value,
+                                    qty=0.0,
+                                    price=None,
+                                    status="REJECTED",
+                                    reason_code=ReasonCode.RISK_BUDGET_REJECT.value,
+                                    reason=risk_note,
+                                    payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
+                                )
+
+                            log_action(logger, "RISK_BUDGET_REJECT", trace_id=trace_id, symbol=symbol,
+                                       reason_code=ReasonCode.RISK_BUDGET_REJECT.value, reason=risk_note,
+                                       ai_score=ai_score, leverage=lev, stop_dist_pct=stop_dist_pct,
+                                       client_order_id=client_order_id)
+                            summary_kv = build_trade_summary(
+                                event="RISK_REJECT",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="BUY",
+                                leverage=lev,
+                                ai_score=ai_score,
+                                stop_dist_pct=stop_dist_pct,
+                                reason_code=ReasonCode.RISK_BUDGET_REJECT,
+                                reason=risk_note,
+                                client_order_id=client_order_id,
+                            )
+                            send_trade_alert(telegram, title="开仓被风控拒绝", summary_kv=summary_kv, payload={"note": risk_note})
+                            continue
+                            if int(lev2) != int(lev):
+                                lev = int(lev2)
+                                append_order_event(
+                                    db,
+                                    trace_id=trace_id,
+                                    service=SERVICE,
+                                    exchange=exchange,
+                                    symbol=symbol,
+                                    client_order_id=None,
+                                    exchange_order_id=None,
+                                    event_type=OrderEventType.CREATED,
+                                    side=Side.BUY.value,
+                                    qty=0.0,
+                                    price=None,
+                                    status="ADJUST",
+                                    reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value,
+                                    reason=risk_note,
+                                    payload={"equity_usdt": equity_usdt, "base_margin_usdt": base_margin_usdt, "stop_dist_pct": float(runtime_cfg.hard_stop_loss_pct), "ai_score": ai_score},
+                                )
+
+                            log_action(logger, "RISK_BUDGET_ADJUST", trace_id=trace_id, symbol=symbol,
+                                       reason_code=ReasonCode.RISK_BUDGET_ADJUST_LEVERAGE.value, reason=risk_note,
+                                       ai_score=ai_score, leverage_before=lev, leverage_after=lev2,
+                                       stop_dist_pct=stop_dist_pct, client_order_id=client_order_id)
+
+                            if hasattr(ex, "set_leverage_and_margin_mode"):
+                                ex.set_leverage_and_margin_mode(symbol=symbol, leverage=lev)
+
+                            client_order_id = make_client_order_id(
+                                "sell",
+                                symbol,
+                                interval_minutes=settings.interval_minutes,
+                                kline_open_time_ms=int(latest["open_time_ms"]),
+                                trace_id=trace_id,
+                            )
+                            append_order_event(
+                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                client_order_id=client_order_id, exchange_order_id=None, event_type=OrderEventType.CREATED,
+                                side=Side.SELL.value, qty=qty, price=None, status="CREATED",
+                                reason_code=ReasonCode.STRATEGY_SIGNAL,
+                                reason="Setup B SELL",
+                                payload={"latest": latest, "robot_score": score, "leverage": lev}
+                            )
+                            summary_kv = build_trade_summary(
+                                event="SELL_SUBMITTED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="SELL",
+                                qty=qty,
+                                price=last_price,
+                                leverage=lev,
+                                reason_code=ReasonCode.STRATEGY_EXIT,
+                                reason="Setup B SELL",
+                                client_order_id=client_order_id,
+                                status="SUBMITTING",
+                            )
+                            send_trade_alert(
+                                telegram,
+                                title="平仓下单已提交",
+                                summary_kv=summary_kv,
+                                payload={
+                                    "client_order_id": client_order_id,
+                                    "symbol": symbol,
+                                    "side": "SELL",
+                                    "qty": float(qty),
+                                    "last_price": float(last_price),
+                                    "leverage": int(lev),
+                                    "reason_code": ReasonCode.STRATEGY_EXIT.value,
+                                    "reason": "Setup B SELL",
+                                },
+                            )
+                            res = ex.place_market_order(symbol=symbol, side="SELL", qty=qty, client_order_id=client_order_id)
+                            append_order_event(
+                                db, trace_id=trace_id, service=SERVICE, exchange=exchange, symbol=symbol,
+                                client_order_id=client_order_id, exchange_order_id=res.exchange_order_id,
+                                event_type=_event_type_from_status(res.status),
+                                side=Side.SELL.value, qty=qty, price=res.avg_price, status=res.status,
+                                reason_code=open_reason_code, reason=open_reason, payload={"exchange": res.raw or {}, "open_reason": open_reason, "open_reason_code": open_reason_code.value}
+                            )
+                            meta2 = _parse_json_maybe(pos.get("meta_json") if pos else None)
+                            trade_id2 = _find_open_trade_id(db, symbol, meta2)
+                            save_position(db, symbol, 0.0, None, {"trace_id": trace_id, "note": "exited", "trade_id": trade_id2, "robot_score": score, "leverage": lev})
+                            close_code = ReasonCode.STRATEGY_EXIT.value
+                            if settings.take_profit_reason_on_positive_pnl and (res.pnl_usdt is not None and float(res.pnl_usdt) > 0):
+                                close_code = ReasonCode.TAKE_PROFIT.value
+                            if trade_id2 > 0:
+                                _close_trade_and_train(
+                                    db,
+                                    settings,
+                                    metrics,
+                                    _load_ai_model(db, settings) if runtime_cfg.ai_enabled else None,
+                                    trade_id=trade_id2,
+                                    symbol=symbol,
+                                    qty=float(qty),
+                                    exit_price=res.avg_price,
+                                    pnl_usdt=res.pnl_usdt,
+                                    close_reason_code=close_code,
+                                    close_reason="Setup B SELL",
+                                    trace_id=trace_id,
+                                    runtime_cfg=runtime_cfg,
+                                )
+                            open_cnt = max(0, open_cnt - 1)
+
+                            summary_kv = build_trade_summary(
+                                event="SELL_FILLED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="SELL",
+                                qty=qty,
+                                price=res.avg_price,
+                                leverage=lev,
+                                reason_code=close_code,
+                                reason="Setup B SELL",
+                                client_order_id=client_order_id,
+                                exchange_order_id=res.exchange_order_id,
+                                extra={"robot_score": round(float(score), 2), "fee_usdt": res.fee_usdt, "pnl_usdt": res.pnl_usdt},
+                            )
+                            send_trade_alert(
+                                telegram,
+                                title="平仓成交",
+                                summary_kv=summary_kv,
+                                payload={
+                                    "client_order_id": client_order_id,
+                                    "exchange_order_id": res.exchange_order_id,
+                                    "avg_price": res.avg_price,
+                                    "fee_usdt": res.fee_usdt,
+                                    "pnl_usdt": res.pnl_usdt,
+                                    "robot_score": score,
+                                    "leverage": lev,
+                                    "raw": res.raw or {},
+                                },
+                            )
+                            log_action(
+                                logger,
+                                "SELL_FILLED",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                side="SELL",
+                                qty=qty,
+                                price=res.avg_price,
+                                leverage=lev,
+                                client_order_id=client_order_id,
+                                exchange_order_id=res.exchange_order_id,
+                                reason_code=close_code,
+                                reason="Setup B SELL",
+                                pnl_usdt=res.pnl_usdt,
+                            )
+                            metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "SELL").inc()
+
+                        metrics.last_tick_success.labels(SERVICE, symbol).set(1)
+
+                # 如果触发紧急退出：在本轮处理完所有 symbol 之后清掉开关
+                if get_flag(db, "EMERGENCY_EXIT", "false") == "true":
+                    set_flag(db, "EMERGENCY_EXIT", "false")
+
+                # status snapshot for /admin/status
+                try:
+                    upsert_service_status(
+                        db,
+                        service_name=SERVICE,
+                        instance_id=instance_id,
+                        status={
+                            "trace_id": trace_id,
+                            "last_tick_id": tick_id,
+                            "last_tick_ts_utc": datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat(),
+                            "last_tick_ts_hk": datetime.datetime.now(HK).isoformat(),
+                            "symbols": getattr(settings, "symbols", []),
+                            "open_positions": open_cnt if "open_cnt" in locals() else None,
+                            "halt": get_flag(db, "HALT_TRADING", "false"),
+                            "emergency": get_flag(db, "EMERGENCY_EXIT", "false"),
+                        },
+                    )
+                except Exception:
+                    pass
+
+            except RateLimitError as e:
+                sleep_s = e.retry_after_seconds or 2.0
+                # 仅对 severe 的限流发送 Telegram，避免刷屏
+                try:
+                    if getattr(e, "severe", False):
+                        send_system_alert(
                             telegram,
-                            title="平仓成交",
-                            summary_kv=summary_kv,
+                            title="⏳ 限流退避",
+                            summary_kv=build_system_summary(
+                                event="RATE_LIMIT_BACKOFF",
+                                trace_id=trace_id,
+                                exchange=exchange,
+                                level="WARN",
+                                reason_code=ReasonCode.RATE_LIMIT_429,
+                                reason=f"rate limit backoff {float(sleep_s):.2f}s",
+                                extra={
+                                    "group": getattr(e, "group", None),
+                                    "sleep_s": round(float(sleep_s), 2),
+                                    "severe": bool(getattr(e, "severe", False)),
+                                },
+                            ),
                             payload={
-                                "client_order_id": client_order_id,
-                                "exchange_order_id": res.exchange_order_id,
-                                "avg_price": res.avg_price,
-                                "fee_usdt": res.fee_usdt,
-                                "pnl_usdt": res.pnl_usdt,
-                                "robot_score": score,
-                                "leverage": lev,
-                                "raw": res.raw or {},
-                            },
-                        )
-                        log_action(
-                            logger,
-                            "SELL_FILLED",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            symbol=symbol,
-                            side="SELL",
-                            qty=qty,
-                            price=res.avg_price,
-                            leverage=lev,
-                            client_order_id=client_order_id,
-                            exchange_order_id=res.exchange_order_id,
-                            reason_code=close_code,
-                            reason="Setup B SELL",
-                            pnl_usdt=res.pnl_usdt,
-                        )
-                        metrics.orders_total.labels(SERVICE, settings.exchange, symbol, "SELL").inc()
-
-                    metrics.last_tick_success.labels(SERVICE, symbol).set(1)
-
-            # 如果触发紧急退出：在本轮处理完所有 symbol 之后清掉开关
-            if get_flag(db, "EMERGENCY_EXIT", "false") == "true":
-                set_flag(db, "EMERGENCY_EXIT", "false")
-
-            # status snapshot for /admin/status
-            try:
-                upsert_service_status(
-                    db,
-                    service_name=SERVICE,
-                    instance_id=instance_id,
-                    status={
-                        "trace_id": trace_id,
-                        "last_tick_id": tick_id,
-                        "last_tick_ts_utc": datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat(),
-                        "last_tick_ts_hk": datetime.datetime.now(HK).isoformat(),
-                        "symbols": getattr(settings, "symbols", []),
-                        "open_positions": open_cnt if "open_cnt" in locals() else None,
-                        "halt": get_flag(db, "HALT_TRADING", "false"),
-                        "emergency": get_flag(db, "EMERGENCY_EXIT", "false"),
-                    },
-                )
-            except Exception:
-                pass
-
-        except RateLimitError as e:
-            sleep_s = e.retry_after_seconds or 2.0
-            # 仅对 severe 的限流发送 Telegram，避免刷屏
-            try:
-                if getattr(e, "severe", False):
-                    send_system_alert(
-                        telegram,
-                        title="⏳ 限流退避",
-                        summary_kv=build_system_summary(
-                            event="RATE_LIMIT_BACKOFF",
-                            trace_id=trace_id,
-                            exchange=exchange,
-                            level="WARN",
-                            reason_code=ReasonCode.RATE_LIMIT_429,
-                            reason=f"rate limit backoff {float(sleep_s):.2f}s",
-                            extra={
                                 "group": getattr(e, "group", None),
-                                "sleep_s": round(float(sleep_s), 2),
+                                "sleep_s": float(sleep_s),
                                 "severe": bool(getattr(e, "severe", False)),
                             },
-                        ),
-                        payload={
+                        )
+                    log_action(
+                        logger,
+                        action="RATE_LIMIT_BACKOFF",
+                        trace_id=trace_id,
+                        reason_code=ReasonCode.RATE_LIMIT_429,
+                        reason=f"rate limit backoff {float(sleep_s):.2f}s",
+                        client_order_id=None,
+                        extra={
                             "group": getattr(e, "group", None),
                             "sleep_s": float(sleep_s),
                             "severe": bool(getattr(e, "severe", False)),
                         },
                     )
-                log_action(
-                    logger,
-                    action="RATE_LIMIT_BACKOFF",
-                    trace_id=trace_id,
-                    reason_code=ReasonCode.RATE_LIMIT_429,
-                    reason=f"rate limit backoff {float(sleep_s):.2f}s",
-                    client_order_id=None,
-                    extra={
-                        "group": getattr(e, "group", None),
-                        "sleep_s": float(sleep_s),
-                        "severe": bool(getattr(e, "severe", False)),
-                    },
-                )
-            except Exception:
-                pass
-            time.sleep(max(0.5, float(sleep_s)))
-            continue
+                except Exception:
+                    pass
+                time.sleep(max(0.5, float(sleep_s)))
+                continue
         except KeyboardInterrupt:
             logger.info("Received SIGINT, shutting down gracefully")
             break
