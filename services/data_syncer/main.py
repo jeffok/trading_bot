@@ -29,6 +29,9 @@ logger = get_logger(SERVICE, os.getenv("LOG_LEVEL", "INFO"))
 # Per-symbol lag alert throttling (in-memory)
 LAG_ALERT_LAST_AT: dict[str, float] = {}
 
+# Per-symbol stale warning throttling (in-memory)
+WS_STALE_WARNING_LAST_AT: dict[str, float] = {}
+
 
 # ----------------------------
 # Indicators (Setup-B friendly)
@@ -1040,7 +1043,18 @@ def main():
                 
                 if not kline_ok or (last_update > 0 and (now - last_update > stale_threshold_ms)):
                     use_rest_sync = True
-                    logger.warning(f"ws_sync_stale symbol={sym} kline_ok={kline_ok} ws_connected={ws_connected} last_update={last_update} stale_threshold_ms={stale_threshold_ms} using_rest_fallback")
+                    # 抑制频繁警告：每个交易对每10分钟最多警告一次
+                    # 如果 WebSocket 连接正常但没有数据，可能是市场休市或K线未关闭，这是正常的
+                    warning_key = f"{sym}_stale"
+                    last_warning_at = WS_STALE_WARNING_LAST_AT.get(warning_key, 0)
+                    warning_interval_ms = 10 * 60 * 1000  # 10分钟
+                    stale_minutes = (now - last_update) / 1000 / 60 if last_update > 0 else 0
+                    if now - last_warning_at > warning_interval_ms:
+                        if ws_connected:
+                            logger.warning(f"ws_sync_stale symbol={sym} kline_ok={kline_ok} ws_connected={ws_connected} last_update={last_update} stale_threshold_ms={stale_threshold_ms} stale_minutes={stale_minutes:.1f} using_rest_fallback (WebSocket connected but no data received)")
+                        else:
+                            logger.warning(f"ws_sync_stale symbol={sym} kline_ok={kline_ok} ws_connected={ws_connected} last_update={last_update} stale_threshold_ms={stale_threshold_ms} stale_minutes={stale_minutes:.1f} using_rest_fallback (WebSocket not connected)")
+                        WS_STALE_WARNING_LAST_AT[warning_key] = now
                     break
         
         # REST API 同步（仅在需要时使用）
