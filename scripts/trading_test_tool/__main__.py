@@ -740,7 +740,12 @@ def main() -> None:
         ))
 
     if args.cmd == "backtest-individual":
+        import sys
+        sys.stderr.write("正在加载 backtest_individual_signals 模块...\n")
+        sys.stderr.flush()
         from scripts.trading_test_tool.backtest_individual_signals import run_individual_signals_test
+        sys.stderr.write("模块加载完成，开始执行回测...\n")
+        sys.stderr.flush()
         raise SystemExit(run_individual_signals_test(
             symbol=getattr(args, "symbol", "BTCUSDT"),
             months=getattr(args, "months", 6),

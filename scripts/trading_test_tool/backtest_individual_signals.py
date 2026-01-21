@@ -377,11 +377,21 @@ def run_individual_signals_test(
     test_all: bool = False,
 ) -> int:
     """运行单独条件测试"""
+    logger.info("开始初始化配置...")
+    sys.stderr.flush()
+    
     settings = load_settings()
+    logger.info("配置加载完成，正在连接数据库...")
+    sys.stderr.flush()
+    
     db = PostgreSQL(settings.postgres_url)
+    logger.info("数据库连接成功，正在加载运行时配置...")
+    sys.stderr.flush()
     
     # 加载运行时配置
     runtime_cfg = RuntimeConfig.load(db, settings)
+    logger.info("运行时配置加载完成")
+    sys.stderr.flush()
     
     # 参数配置
     interval_minutes = interval_minutes or int(settings.interval_minutes or 15)
