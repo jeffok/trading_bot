@@ -25,6 +25,7 @@ Trading Test Tool - 交易系统管理工具（仅在Docker中使用）
     - e2e-test: 端到端测试
     - backtest: 历史回测工具（需要token）
     - backtest-with-pnl: 历史回测工具（带盈利计算）
+    - backtest-individual: 单独测试Setup B各条件
     - query: SQL查询（调试用）
     - seed: 生成合成测试数据
     - restart: 重启服务
@@ -577,6 +578,13 @@ def main() -> None:
     p_backtest_pnl.add_argument("--fee-rate", type=float, default=0.0004, dest="fee_rate", help="手续费率（默认：0.0004 = 0.04%）")
     p_backtest_pnl.add_argument("--slippage-rate", type=float, default=0.001, dest="slippage_rate", help="滑点率（默认：0.001 = 0.1%）")
 
+    p_backtest_individual = sub.add_parser("backtest-individual", help="单独测试Setup B各条件：分析每个条件的信号数量和表现")
+    p_backtest_individual.add_argument("--symbol", type=str, default="BTCUSDT", help="交易对符号（默认：BTCUSDT）")
+    p_backtest_individual.add_argument("--months", type=int, default=6, help="回测月数（默认：6个月）")
+    p_backtest_individual.add_argument("--interval", type=int, default=None, help="K线周期（分钟，默认使用配置）")
+    p_backtest_individual.add_argument("--conditions", type=str, nargs="+", default=None, help="要测试的条件列表（如: adx_di squeeze_release）")
+    p_backtest_individual.add_argument("--test-all", action="store_true", help="测试所有5个条件")
+
     p_seed = sub.add_parser("seed", help="生成合成市场数据（用于测试）")
     p_seed.add_argument("--bars", type=int, default=260, help="生成的K线数量（默认：260）")
     p_seed.add_argument("--start-price", type=float, default=40000, dest="start_price", help="起始价格（默认：40000）")
@@ -729,6 +737,16 @@ def main() -> None:
             initial_equity_usdt=getattr(args, "equity", 1000.0),
             fee_rate=getattr(args, "fee_rate", 0.0004),
             slippage_rate=getattr(args, "slippage_rate", 0.001),
+        ))
+
+    if args.cmd == "backtest-individual":
+        from scripts.trading_test_tool.backtest_individual_signals import run_individual_signals_test
+        raise SystemExit(run_individual_signals_test(
+            symbol=getattr(args, "symbol", "BTCUSDT"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval", None),
+            condition_names=getattr(args, "conditions", None),
+            test_all=getattr(args, "test_all", False),
         ))
 
     if args.cmd == "seed":

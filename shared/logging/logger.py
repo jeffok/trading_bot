@@ -23,7 +23,8 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
     if logger.handlers:
         return logger
     logger.setLevel(level.upper())
-    h = logging.StreamHandler()
+    import sys
+    h = logging.StreamHandler(sys.stderr)  # 明确输出到 stderr
     h.setFormatter(KVFormatter())
     logger.addHandler(h)
     logger.propagate = False

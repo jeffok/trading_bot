@@ -1269,6 +1269,10 @@ def run_backtest_with_pnl(
     sys.stdout.write("\n" + report + "\n")
     sys.stdout.flush()
     
+    logger.info("回测完成")
+    # 确保日志输出被刷新
+    sys.stderr.flush()
+    
     # 9. 保存详细结果到JSON（可选）
     results_file = Path(__file__).parent / f"backtest_results_{symbol}_{int(time.time())}.json"
     results_data = {
@@ -1286,7 +1290,8 @@ def run_backtest_with_pnl(
         json.dump(results_data, f, indent=2, ensure_ascii=False, default=str)
     
     logger.info(f"详细结果已保存到: {results_file}")
-    logger.info("回测完成")
+    # 确保日志输出被刷新
+    sys.stderr.flush()
     
     db.close()
     return 0
