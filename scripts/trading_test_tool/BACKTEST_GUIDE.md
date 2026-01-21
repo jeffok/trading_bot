@@ -9,14 +9,44 @@
 
 ## 快速开始
 
-### 1. 基础回测（仅信号统计）
+### 🐳 Docker 容器中运行（推荐）
+
+项目使用 Docker Compose 运行，所有工具都在容器中可用：
+
+#### 方式1: 使用 tbot 命令（推荐）
+
+```bash
+# 进入 api-service 容器运行回测
+docker compose exec api-service tbot backtest-with-pnl \
+    --symbol BTCUSDT \
+    --months 6 \
+    --equity 1000 \
+    --fee-rate 0.0004 \
+    --slippage-rate 0.001
+```
+
+#### 方式2: 直接使用 Python 模块
+
+```bash
+# 进入 api-service 容器
+docker compose exec api-service python3 -m scripts.trading_test_tool.backtest_with_pnl \
+    --symbol BTCUSDT \
+    --months 6 \
+    --equity 1000 \
+    --fee-rate 0.0004 \
+    --slippage-rate 0.001
+```
+
+### 💻 本地环境运行
+
+#### 1. 基础回测（仅信号统计）
 
 ```bash
 cd /Users/jeff/Project/trading_bot
 python3 -m scripts.trading_test_tool.backtest --symbol BTCUSDT --months 6
 ```
 
-### 2. 完整回测（信号 + 盈利分析）⭐
+#### 2. 完整回测（信号 + 盈利分析）⭐
 
 ```bash
 cd /Users/jeff/Project/trading_bot

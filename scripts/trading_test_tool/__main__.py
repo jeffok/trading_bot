@@ -24,6 +24,7 @@ Trading Test Tool - 交易系统管理工具（仅在Docker中使用）
     - smoke-test: 链路自检
     - e2e-test: 端到端测试
     - backtest: 历史回测工具（需要token）
+    - backtest-with-pnl: 历史回测工具（带盈利计算）
     - query: SQL查询（调试用）
     - seed: 生成合成测试数据
     - restart: 重启服务
@@ -568,6 +569,14 @@ def main() -> None:
     p_backtest.add_argument("--interval", type=int, default=None, help="K线周期（分钟，默认使用配置）")
     p_backtest.add_argument("--feature-version", type=int, default=None, dest="feature_version", help="特征版本（默认使用配置）")
 
+    p_backtest_pnl = sub.add_parser("backtest-with-pnl", help="历史回测工具（带盈利计算）：分析Setup B信号并计算每笔交易的盈利")
+    p_backtest_pnl.add_argument("--symbol", type=str, default="BTCUSDT", help="交易对符号（默认：BTCUSDT）")
+    p_backtest_pnl.add_argument("--months", type=int, default=6, help="回测月数（默认：6个月）")
+    p_backtest_pnl.add_argument("--interval", type=int, default=None, help="K线周期（分钟，默认使用配置）")
+    p_backtest_pnl.add_argument("--equity", type=float, default=1000.0, help="初始资金USDT（默认：1000）")
+    p_backtest_pnl.add_argument("--fee-rate", type=float, default=0.0004, dest="fee_rate", help="手续费率（默认：0.0004 = 0.04%）")
+    p_backtest_pnl.add_argument("--slippage-rate", type=float, default=0.001, dest="slippage_rate", help="滑点率（默认：0.001 = 0.1%）")
+
     p_seed = sub.add_parser("seed", help="生成合成市场数据（用于测试）")
     p_seed.add_argument("--bars", type=int, default=260, help="生成的K线数量（默认：260）")
     p_seed.add_argument("--start-price", type=float, default=40000, dest="start_price", help="起始价格（默认：40000）")
@@ -584,6 +593,17 @@ def main() -> None:
     p_config = sub.add_parser("config", help="输出所有配置参数（以JSON格式）")
 
     args = parser.parse_args()
+
+    # 提前初始化 db, telegram, trace_id（某些命令需要）
+    db = None
+    telegram = None
+    trace_id = None
+    
+    # 对于需要这些变量的命令，提前初始化
+    if args.cmd in ("set", "get", "list", "halt", "resume", "emergency-exit", "arm-stop", "status", "prepare", "config"):
+        db = PostgreSQL(settings.postgres_url)
+        telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
+        trace_id = new_trace_id("admin")
 
     if args.cmd == "set":
         expected_reason_code(args.reason_code, "ADMIN_UPDATE_CONFIG")
@@ -700,6 +720,17 @@ def main() -> None:
             feature_version=getattr(args, "feature_version", None),
         ))
 
+    if args.cmd == "backtest-with-pnl":
+        from scripts.trading_test_tool.backtest_with_pnl import run_backtest_with_pnl
+        raise SystemExit(run_backtest_with_pnl(
+            symbol=getattr(args, "symbol", "BTCUSDT"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval", None),
+            initial_equity_usdt=getattr(args, "equity", 1000.0),
+            fee_rate=getattr(args, "fee_rate", 0.0004),
+            slippage_rate=getattr(args, "slippage_rate", 0.001),
+        ))
+
     if args.cmd == "seed":
         from scripts.trading_test_tool.seed import run_seed
         raise SystemExit(run_seed(
@@ -726,9 +757,11 @@ def main() -> None:
             raise SystemExit(1)
 
     # 下面是原有简单命令（需要 db 和 telegram）
-    db = PostgreSQL(settings.postgres_url)
-    telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
-    trace_id = new_trace_id("admin")
+    # 注意：db, telegram, trace_id 已在上面提前初始化（如果命令需要）
+    if db is None and args.cmd in ("prepare", "status", "halt", "resume", "emergency-exit", "arm-stop", "config"):
+        db = PostgreSQL(settings.postgres_url)
+        telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
+        trace_id = new_trace_id("admin")
 
     if args.cmd == "prepare":
         # prepare命令等同于status，用于Docker环境
