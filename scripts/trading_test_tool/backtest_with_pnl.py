@@ -817,17 +817,23 @@ def calculate_statistics(
             "total_trades": 0,
             "winning_trades": 0,
             "losing_trades": 0,
+            "break_even_trades": 0,
             "win_rate": 0.0,
             "total_pnl_usdt": 0.0,
             "total_net_pnl_usdt": 0.0,
+            "total_fee_usdt": 0.0,
             "total_return_pct": 0.0,
             "avg_win_usdt": 0.0,
             "avg_loss_usdt": 0.0,
             "profit_factor": 0.0,
+            "max_win_usdt": 0.0,
+            "max_loss_usdt": 0.0,
             "max_drawdown_usdt": 0.0,
             "max_drawdown_pct": 0.0,
             "sharpe_ratio": 0.0,
             "avg_holding_hours": 0.0,
+            "exit_reasons": {},
+            "final_equity_usdt": initial_equity_usdt,
         }
     
     # 过滤有效交易（排除风控拒绝等）
@@ -839,17 +845,23 @@ def calculate_statistics(
             "total_trades": 0,
             "winning_trades": 0,
             "losing_trades": 0,
+            "break_even_trades": 0,
             "win_rate": 0.0,
             "total_pnl_usdt": 0.0,
             "total_net_pnl_usdt": 0.0,
+            "total_fee_usdt": 0.0,
             "total_return_pct": 0.0,
             "avg_win_usdt": 0.0,
             "avg_loss_usdt": 0.0,
             "profit_factor": 0.0,
+            "max_win_usdt": 0.0,
+            "max_loss_usdt": 0.0,
             "max_drawdown_usdt": 0.0,
             "max_drawdown_pct": 0.0,
             "sharpe_ratio": 0.0,
             "avg_holding_hours": 0.0,
+            "exit_reasons": {},
+            "final_equity_usdt": initial_equity_usdt,
         }
     
     # 基础统计
@@ -1253,7 +1265,9 @@ def run_backtest_with_pnl(
         initial_equity_usdt=initial_equity_usdt,
     )
     
-    print("\n" + report)
+    # 输出报告（使用 sys.stdout 确保输出到控制台，避免被日志系统捕获）
+    sys.stdout.write("\n" + report + "\n")
+    sys.stdout.flush()
     
     # 9. 保存详细结果到JSON（可选）
     results_file = Path(__file__).parent / f"backtest_results_{symbol}_{int(time.time())}.json"
