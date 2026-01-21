@@ -900,3 +900,82 @@ def admin_update_config(
         payload_extra={"reason_code": cmd.reason_code, "key": key, "value": value, "reason": reason},
     )
     return {"ok": True, "trace_id": trace_id}
+
+
+# ===== 回测相关 API =====
+
+class BacktestRequest(BaseModel):
+    symbol: str = Field(default="BTCUSDT", description="交易对")
+    months: int = Field(default=6, description="回测月数")
+    interval_minutes: Optional[int] = Field(default=None, description="K线周期（分钟）")
+    feature_version: Optional[int] = Field(default=None, description="特征版本")
+    initial_equity_usdt: float = Field(default=1000.0, description="初始资金USDT")
+    fee_rate: float = Field(default=0.0004, description="手续费率")
+    slippage_rate: float = Field(default=0.001, description="滑点率")
+
+
+class BacktestIndividualRequest(BaseModel):
+    symbol: str = Field(default="BTCUSDT", description="交易对")
+    months: int = Field(default=6, description="回测月数")
+    interval_minutes: Optional[int] = Field(default=None, description="K线周期（分钟）")
+    conditions: Optional[List[str]] = Field(default=None, description="要测试的条件列表")
+    test_all: bool = Field(default=False, description="测试所有5个条件")
+
+
+@app.post("/admin/backtest-with-pnl")
+def admin_backtest_with_pnl(
+    req: BacktestRequest,
+    settings: Settings = Depends(get_settings),
+    db: PostgreSQL = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    """回测工具（带盈利计算）"""
+    trace_id = new_trace_id("backtest_pnl")
+    
+    try:
+        from scripts.trading_test_tool.backtest_with_pnl import run_backtest_with_pnl
+        
+        # 直接执行（同步），日志会输出到 stderr，可以通过 docker logs 查看
+        result = run_backtest_with_pnl(
+            symbol=req.symbol,
+            months=req.months,
+            interval_minutes=req.interval_minutes,
+            initial_equity_usdt=req.initial_equity_usdt,
+            fee_rate=req.fee_rate,
+            slippage_rate=req.slippage_rate,
+        )
+        
+        return {"ok": True, "exit_code": result, "trace_id": trace_id}
+        
+    except Exception as e:
+        logger.exception(f"backtest_with_pnl failed trace_id={trace_id}")
+        return {"ok": False, "error": str(e), "trace_id": trace_id}
+
+
+@app.post("/admin/backtest-individual")
+def admin_backtest_individual(
+    req: BacktestIndividualRequest,
+    settings: Settings = Depends(get_settings),
+    db: PostgreSQL = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    """单独测试Setup B各条件"""
+    trace_id = new_trace_id("backtest_individual")
+    
+    try:
+        from scripts.trading_test_tool.backtest_individual_signals import run_individual_signals_test
+        
+        # 直接执行（同步），日志会输出到 stderr，可以通过 docker logs 查看
+        result = run_individual_signals_test(
+            symbol=req.symbol,
+            months=req.months,
+            interval_minutes=req.interval_minutes,
+            condition_names=req.conditions,
+            test_all=req.test_all,
+        )
+        
+        return {"ok": True, "exit_code": result, "trace_id": trace_id}
+        
+    except Exception as e:
+        logger.exception(f"backtest_individual failed trace_id={trace_id}")
+        return {"ok": False, "error": str(e), "trace_id": trace_id}

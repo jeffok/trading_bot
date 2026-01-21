@@ -5,15 +5,35 @@
 
 set -e
 
-# 获取脚本所在目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-# 如果使用 pip install -e . 安装，直接调用 tbot
-if command -v tbot &> /dev/null; then
-    exec tbot "$@"
+# 优先使用 Docker 容器内的已知路径（/app）
+if [ -d "/app" ] && [ -f "/app/scripts/tbot" ]; then
+    PROJECT_ROOT="/app"
+else
+    # 否则计算脚本的实际路径（处理符号链接）
+    SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+    
+    # 如果是符号链接，获取实际路径
+    if [ -L "$SCRIPT_SOURCE" ]; then
+        # Linux (Docker) 使用 readlink -f
+        REAL_PATH="$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null)"
+        if [ -z "$REAL_PATH" ]; then
+            # macOS 使用 readlink
+            REAL_PATH="$(readlink "$SCRIPT_SOURCE" 2>/dev/null)"
+            if [ -n "$REAL_PATH" ]; then
+                # macOS readlink 可能返回相对路径
+                if [ "${REAL_PATH#/}" = "$REAL_PATH" ]; then
+                    REAL_PATH="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)/$REAL_PATH"
+                fi
+            fi
+        fi
+        [ -n "$REAL_PATH" ] && SCRIPT_SOURCE="$REAL_PATH"
+    fi
+    
+    # 获取脚本所在目录
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 
-# 否则使用 python -m 方式
+# 切换到项目根目录并执行 Python 模块
 cd "$PROJECT_ROOT"
 exec python3 -m scripts.trading_test_tool "$@"

@@ -585,6 +585,29 @@ def main() -> None:
     p_backtest_individual.add_argument("--conditions", type=str, nargs="+", default=None, help="要测试的条件列表（如: adx_di squeeze_release）")
     p_backtest_individual.add_argument("--test-all", action="store_true", help="测试所有5个条件")
 
+    p_backtest_combinations = sub.add_parser("backtest-combinations", help="测试Setup B条件组合的盈利情况：对比不同组合的胜率、盈亏比等指标")
+    p_backtest_combinations.add_argument("--symbol", type=str, default="BTCUSDT", help="交易对符号（默认：BTCUSDT）")
+    p_backtest_combinations.add_argument("--months", type=int, default=6, help="回测月数（默认：6个月）")
+    p_backtest_combinations.add_argument("--interval", type=int, default=None, help="K线周期（分钟，默认使用配置）")
+    p_backtest_combinations.add_argument("--combinations", type=str, nargs="+", default=None, help="要测试的组合，用+连接（如: adx_di+squeeze_release adx_di+momentum_flip）")
+    p_backtest_combinations.add_argument("--equity", type=float, default=1000.0, help="初始资金USDT（默认：1000）")
+    p_backtest_combinations.add_argument("--fee-rate", type=float, default=0.0004, dest="fee_rate", help="手续费率（默认：0.0004 = 0.04%）")
+    p_backtest_combinations.add_argument("--slippage-rate", type=float, default=0.001, dest="slippage_rate", help="滑点率（默认：0.001 = 0.1%）")
+    p_backtest_combinations.add_argument("--stop-loss", type=float, default=0.02, dest="stop_loss", help="止损比例（默认：0.02 = 2%）")
+    p_backtest_combinations.add_argument("--take-profit", type=float, default=0.04, dest="take_profit", help="止盈比例（默认：0.04 = 4%）")
+
+    p_backtest_detailed = sub.add_parser("backtest-detailed", help="生成详细回测报告：包含每次信号的完整信息（买卖时间、收益率、盈亏比等）")
+    p_backtest_detailed.add_argument("--symbol", type=str, default="BTCUSDT", help="交易对符号（默认：BTCUSDT）")
+    p_backtest_detailed.add_argument("--months", type=int, default=6, help="回测月数（默认：6个月）")
+    p_backtest_detailed.add_argument("--interval", type=int, default=None, help="K线周期（分钟，默认使用配置）")
+    p_backtest_detailed.add_argument("--combinations", type=str, nargs="+", required=True, help="要测试的组合，用+连接（必需参数）")
+    p_backtest_detailed.add_argument("--equity", type=float, default=1000.0, help="初始资金USDT（默认：1000）")
+    p_backtest_detailed.add_argument("--profit-withdrawal", type=float, default=500.0, dest="profit_withdrawal_threshold", help="盈利提取阈值（默认：500 USDT，盈利达到此金额时提取）")
+    p_backtest_detailed.add_argument("--fee-rate", type=float, default=0.0004, dest="fee_rate", help="手续费率（默认：0.0004 = 0.04%）")
+    p_backtest_detailed.add_argument("--slippage-rate", type=float, default=0.001, dest="slippage_rate", help="滑点率（默认：0.001 = 0.1%）")
+    p_backtest_detailed.add_argument("--stop-loss", type=float, default=0.02, dest="stop_loss", help="止损比例（默认：0.02 = 2%）")
+    p_backtest_detailed.add_argument("--take-profit", type=float, default=0.04, dest="take_profit", help="止盈比例（默认：0.04 = 4%）")
+
     p_seed = sub.add_parser("seed", help="生成合成市场数据（用于测试）")
     p_seed.add_argument("--bars", type=int, default=260, help="生成的K线数量（默认：260）")
     p_seed.add_argument("--start-price", type=float, default=40000, dest="start_price", help="起始价格（默认：40000）")
@@ -709,6 +732,31 @@ def main() -> None:
     if args.cmd == "query":
         db = PostgreSQL(settings.postgres_url)
         try:
+            sql = getattr(args, "sql", "")
+            if not sql:
+                print("❌ 请提供SQL查询语句（--sql）", file=sys.stderr)
+                return 1
+            rows = db.fetch_all(sql)
+            if not rows:
+                print("查询结果为空")
+                return 0
+            # 打印表头
+            if rows:
+                print(" | ".join(str(k) for k in rows[0].keys()))
+                print("-" * 80)
+            # 打印数据
+            for row in rows:
+                print(" | ".join(str(v) if v is not None else "NULL" for v in row.values()))
+            return 0
+        except Exception as e:
+            print(f"❌ 查询失败: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            return 1
+        finally:
+            db.close()
+        db = PostgreSQL(settings.postgres_url)
+        try:
             rows = db.fetch_all(getattr(args, "sql", ""))
             print(json.dumps(rows, ensure_ascii=False, indent=2, default=_json_default))
             return 0
@@ -729,6 +777,7 @@ def main() -> None:
         ))
 
     if args.cmd == "backtest-with-pnl":
+        # 直接执行 Python 代码（不需要环境变量）
         from scripts.trading_test_tool.backtest_with_pnl import run_backtest_with_pnl
         raise SystemExit(run_backtest_with_pnl(
             symbol=getattr(args, "symbol", "BTCUSDT"),
@@ -740,18 +789,49 @@ def main() -> None:
         ))
 
     if args.cmd == "backtest-individual":
-        import sys
-        sys.stderr.write("正在加载 backtest_individual_signals 模块...\n")
-        sys.stderr.flush()
+        # 直接执行 Python 代码（不需要环境变量）
         from scripts.trading_test_tool.backtest_individual_signals import run_individual_signals_test
-        sys.stderr.write("模块加载完成，开始执行回测...\n")
-        sys.stderr.flush()
         raise SystemExit(run_individual_signals_test(
             symbol=getattr(args, "symbol", "BTCUSDT"),
             months=getattr(args, "months", 6),
             interval_minutes=getattr(args, "interval", None),
             condition_names=getattr(args, "conditions", None),
             test_all=getattr(args, "test_all", False),
+        ))
+
+    if args.cmd == "backtest-combinations":
+        # 直接执行 Python 代码（不需要环境变量）
+        from scripts.trading_test_tool.backtest_condition_combinations import run_combination_backtest
+        raise SystemExit(run_combination_backtest(
+            symbol=getattr(args, "symbol", "BTCUSDT"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval", None),
+            combinations=getattr(args, "combinations", None),
+            initial_equity_usdt=getattr(args, "equity", 1000.0),
+            fee_rate=getattr(args, "fee_rate", 0.0004),
+            slippage_rate=getattr(args, "slippage_rate", 0.001),
+            stop_loss_pct=getattr(args, "stop_loss", 0.02),
+            take_profit_pct=getattr(args, "take_profit", 0.04),
+        ))
+
+    if args.cmd == "backtest-detailed":
+        # 直接执行 Python 代码（不需要环境变量）
+        from scripts.trading_test_tool.backtest_detailed_report import run_detailed_backtest
+        combinations = getattr(args, "combinations", None)
+        if not combinations:
+            print("错误: --combinations 参数是必需的", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(run_detailed_backtest(
+            symbol=getattr(args, "symbol", "BTCUSDT"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval", None),
+            combinations=combinations,
+            initial_equity_usdt=getattr(args, "equity", 1000.0),
+            profit_withdrawal_threshold=getattr(args, "profit_withdrawal_threshold", 500.0),
+            fee_rate=getattr(args, "fee_rate", 0.0004),
+            slippage_rate=getattr(args, "slippage_rate", 0.001),
+            stop_loss_pct=getattr(args, "stop_loss", 0.02),
+            take_profit_pct=getattr(args, "take_profit", 0.04),
         ))
 
     if args.cmd == "seed":

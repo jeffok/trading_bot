@@ -203,8 +203,17 @@ def analyze_individual_signals(
     # 为每个条件初始化信号列表
     signals_by_condition = {name: [] for name in condition_names}
     
+    total_rows = len(rows)
+    logger.info(f"开始分析 {total_rows} 条K线数据，检查 {len(condition_names)} 个条件")
+    
     # 逐条分析
+    last_progress_log = 0
     for i in range(1, len(rows)):
+        # 每处理1000条记录输出一次进度
+        if i - last_progress_log >= 1000:
+            progress_pct = (i / total_rows * 100.0) if total_rows > 0 else 0.0
+            logger.info(f"分析进度: {i}/{total_rows} ({progress_pct:.1f}%)")
+            last_progress_log = i
         current = rows[i]
         prev = rows[i - 1]
         
@@ -251,6 +260,9 @@ def analyze_individual_signals(
                     "reason": reason,
                     "kline_start_index": i,
                 })
+    
+    # 输出最终进度
+    logger.info(f"分析完成，共处理 {total_rows - 1} 条K线记录")
     
     return signals_by_condition
 
@@ -378,8 +390,6 @@ def run_individual_signals_test(
 ) -> int:
     """运行单独条件测试"""
     logger.info("开始初始化配置...")
-    sys.stderr.flush()
-    
     settings = load_settings()
     logger.info("配置加载完成，正在连接数据库...")
     sys.stderr.flush()
@@ -421,6 +431,9 @@ def run_individual_signals_test(
     logger.info(f"测试条件: {', '.join(condition_names)}")
     
     # 获取所有K线数据
+    logger.info("正在查询K线数据（这可能需要一些时间）...")
+    
+    query_start_time = time.time()
     all_kline_rows = db.fetch_all(
         """
         SELECT 
@@ -448,6 +461,9 @@ def run_individual_signals_test(
         """,
         (symbol, interval_minutes, feature_version, start_time_ms, end_time_ms),
     )
+    query_duration = time.time() - query_start_time
+    
+    logger.info(f"K线数据查询完成，耗时 {query_duration:.2f} 秒，获取到 {len(all_kline_rows) if all_kline_rows else 0} 条记录")
     
     if not all_kline_rows:
         logger.warning("没有可用于分析的K线数据")
@@ -459,6 +475,7 @@ def run_individual_signals_test(
     
     # 分析每个条件的信号
     logger.info("分析各条件的信号...")
+    analysis_start_time = time.time()
     signals_by_condition = analyze_individual_signals(
         db,
         settings,
@@ -470,6 +487,13 @@ def run_individual_signals_test(
         end_time_ms=end_time_ms,
         condition_names=condition_names,
     )
+    analysis_duration = time.time() - analysis_start_time
+    
+    logger.info(f"信号分析完成，耗时 {analysis_duration:.2f} 秒")
+    
+    # 统计每个条件的信号数量
+    for cond_name, signals in signals_by_condition.items():
+        logger.info(f"条件 {cond_name}: 找到 {len(signals)} 个信号")
     
     # 生成报告
     logger.info("生成对比报告...")
