@@ -355,9 +355,25 @@ def analyze_setup_b_signals(
         current = rows[i]
         prev = rows[i - 1]
         
-        # 解析features_json
-        current_features = json.loads(current["features_json"] or "{}")
-        prev_features = json.loads(prev["features_json"] or "{}")
+        # 解析features_json（处理可能是字符串或字典的情况）
+        def _parse_json_maybe(s: object) -> dict:
+            """解析JSONB字段，可能是字符串或字典"""
+            try:
+                if s is None:
+                    return {}
+                if isinstance(s, dict):
+                    return s
+                if isinstance(s, str):
+                    s2 = s.strip()
+                    if not s2:
+                        return {}
+                    return json.loads(s2)
+                return {}
+            except Exception:
+                return {}
+        
+        current_features = _parse_json_maybe(current.get("features_json"))
+        prev_features = _parse_json_maybe(prev.get("features_json"))
         
         # 构建用于setup_b_decision的字典
         current_dict = {
