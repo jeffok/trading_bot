@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import math
@@ -422,13 +423,20 @@ def generate_detailed_report(
     lines.append(f"账户收益率: {account_return_pct:.2f}%")
     
     # AI模型状态
-    if ai_model_seen > 0:
+    ai_scorer_type = getattr(generate_detailed_report, "_ai_scorer_type", "none")
+    if ai_scorer_type == "llm":
+        lines.append("AI评分器: LLM (ChatGPT/DeepSeek)")
+        avg_ai_score = sum(t.get("ai_score", 50.0) for t in trades) / len(trades) if trades else 50.0
+        min_ai_score = min((t.get("ai_score", 50.0) for t in trades), default=50.0)
+        max_ai_score = max((t.get("ai_score", 50.0) for t in trades), default=50.0)
+        lines.append(f"平均AI评分: {avg_ai_score:.1f} (范围: {min_ai_score:.1f} - {max_ai_score:.1f})")
+    elif ai_model_seen > 0:
         lines.append(f"AI模型训练样本数: {ai_model_seen}")
         avg_ai_score = sum(t.get("ai_score", 50.0) for t in trades) / len(trades) if trades else 50.0
         lines.append(f"平均AI评分: {avg_ai_score:.1f}")
     else:
         lines.append("AI模型状态: 未训练（所有评分固定为50.0）")
-        lines.append("提示: AI模型需要在实盘交易中通过历史交易数据进行训练")
+        lines.append("提示: AI模型需要在实盘交易中通过历史交易数据进行训练，或配置LLM评分器")
     
     lines.append(f"总交易数: {total_trades}")
     lines.append(f"盈利交易: {len(winning_trades)} ({win_rate:.1f}%)")
@@ -608,10 +616,33 @@ def run_detailed_backtest(
     
     logger.info(f"获取到 {len(rows)} 条K线数据")
     
-    # 加载AI模型（如果启用）
+    # 加载AI模型或LLM评分器（如果启用）
     ai_model = None
+    llm_scorer = None
     ai_model_seen = 0
-    if runtime_cfg and runtime_cfg.ai_enabled:
+    ai_scorer_type = "none"
+    
+    # 优先使用LLM评分器（如果配置了）
+    llm_failed = False  # 完全失败标志（API和数据库都不可用）
+    llm_api_failed = False  # API失败标志（但数据库缓存仍可用）
+    llm_fallback_enabled = os.getenv("LLM_FALLBACK_TO_AI", "false").lower() == "true"
+    
+    try:
+        from shared.ai.llm_scorer import create_llm_scorer_from_env
+        llm_scorer = create_llm_scorer_from_env(db=db)
+        if llm_scorer:
+            ai_scorer_type = "llm"
+            logger.info("LLM评分器已启用（ChatGPT/DeepSeek），将使用LLM进行评分")
+            if llm_fallback_enabled:
+                logger.info("LLM回退已启用：LLM失败时将自动回退到传统AI模型")
+            else:
+                logger.info("LLM回退已禁用：LLM失败时将使用默认评分50.0（不会回退到传统AI模型）")
+    except Exception as e:
+        logger.debug(f"LLM评分器未配置: {e}")
+        llm_scorer = None
+    
+    # 如果没有LLM，且允许回退，尝试加载传统AI模型
+    if not llm_scorer and llm_fallback_enabled and runtime_cfg and runtime_cfg.ai_enabled:
         try:
             ai_model = _load_ai_model(db, settings, runtime_cfg)
             # 检查模型的训练状态
@@ -621,11 +652,13 @@ def run_detailed_backtest(
                 logger.warning("提示：AI模型需要在实盘交易中通过 partial_fit 进行训练")
             else:
                 logger.info(f"AI模型加载成功，已训练样本数: {ai_model_seen}，将使用真实AI评分")
+                ai_scorer_type = "model"
         except Exception as e:
             logger.warning(f"AI模型加载失败，将使用默认评分50.0: {e}")
             ai_model = None
-    else:
-        logger.info("AI未启用（runtime_cfg.ai_enabled=False），将使用默认评分50.0")
+    
+    if ai_scorer_type == "none":
+        logger.info("AI未启用，将使用默认评分50.0")
     
     # 对每个组合进行回测
     for combination in combinations:
@@ -634,44 +667,194 @@ def run_detailed_backtest(
         
         # 查找所有信号（做多和做空）
         signals = []
+        
+        # 如果使用LLM，先测试是否可用（但即使失败，仍可使用数据库缓存）
+        if llm_scorer is not None:
+            logger.info("正在测试LLM评分器...")
+            try:
+                # 测试LLM是否可用（尝试一次调用）
+                test_features = _parse_json_maybe(rows[1].get("features_json")) if len(rows) > 1 else {}
+                if test_features:
+                    test_score = llm_scorer.score(test_features, symbol=symbol, direction="LONG")
+                    if test_score is None:
+                        logger.warning("⚠️  LLM API测试失败（返回None），但将继续使用数据库缓存（如果可用）")
+                        llm_api_failed = True  # API失败，但数据库缓存仍可用
+                    elif test_score == 50.0:
+                        # 可能是默认值，检查是否有错误日志
+                        logger.warning("⚠️  LLM评分器可能失败（返回默认值50.0），但将继续使用数据库缓存（如果可用）")
+                        llm_api_failed = True
+                    else:
+                        logger.info(f"✅ LLM评分器测试成功，评分: {test_score:.1f}")
+                        logger.info("💡 提示：如果数据库中有缓存，将优先使用缓存，避免重复API调用")
+                        llm_api_failed = False
+                else:
+                    logger.warning("⚠️  无法获取测试特征，但将继续使用数据库缓存（如果可用）")
+                    llm_api_failed = True
+            except Exception as e:
+                logger.warning(f"⚠️  LLM API测试失败: {e}，但将继续使用数据库缓存（如果可用）")
+                llm_api_failed = True
+        else:
+            llm_api_failed = False
+        
+        # 如果LLM API失败且允许回退，确保使用传统AI模型
+        # 注意：即使API失败，数据库缓存仍可用，所以不在这里设置llm_failed
+        if llm_api_failed and llm_fallback_enabled and ai_model is None and runtime_cfg and runtime_cfg.ai_enabled:
+            try:
+                ai_model = _load_ai_model(db, settings, runtime_cfg)
+                ai_model_seen = getattr(ai_model, "seen", 0)
+                if ai_model_seen > 0:
+                    logger.info(f"已加载传统AI模型（训练样本数: {ai_model_seen}）")
+                else:
+                    logger.warning("传统AI模型未训练，将使用默认评分50.0")
+            except Exception as e:
+                logger.debug(f"无法加载传统AI模型: {e}")
+        
+        logger.info("开始分析信号...")
+        llm_call_count = 0
+        llm_cache_hits = 0
+        llm_error_count = 0
+        
+        # 第一阶段：先找出所有可能的信号（使用默认AI评分）
+        temp_ai_score = 50.0
+        candidate_signals = []  # [(idx, direction, features)]
+        
         for i in range(1, len(rows)):
             current = rows[i]
             prev = rows[i - 1]
             
-            # 计算真实的AI评分
-            ai_score = 50.0  # 默认值
-            if ai_model is not None:
+            # 检查做多信号（先用默认AI评分检查）
+            should_check_long = check_combination(
+                current,
+                prev,
+                condition_names=condition_names,
+                runtime_cfg=runtime_cfg,
+                settings=settings,
+                ai_score=temp_ai_score,
+                direction="LONG",
+            )
+            
+            # 检查做空信号（先用默认AI评分检查）
+            should_check_short = check_combination(
+                current,
+                prev,
+                condition_names=condition_names,
+                runtime_cfg=runtime_cfg,
+                settings=settings,
+                ai_score=temp_ai_score,
+                direction="SHORT",
+            )
+            
+            if should_check_long or should_check_short:
+                features = _parse_json_maybe(current.get("features_json"))
+                if features:
+                    if should_check_long:
+                        candidate_signals.append((i, "LONG", features))
+                    if should_check_short:
+                        candidate_signals.append((i, "SHORT", features))
+        
+        logger.info(f"找到 {len(candidate_signals)} 个候选信号，开始批量评分...")
+        
+        # 第二阶段：批量评分（如果使用LLM，即使API失败也尝试使用数据库缓存）
+        ai_scores = {}  # {(idx, direction): score}
+        
+        if llm_scorer is not None and candidate_signals:
+            try:
+                # 准备批量评分请求
+                batch_requests = [(feat, symbol, direction) for _, direction, feat in candidate_signals]
+                
+                # 批量评分（并发）
+                max_workers = int(os.getenv("LLM_MAX_WORKERS", "10"))
+                logger.info(f"使用批量并发评分（最大并发数: {max_workers}）...")
+                start_time = time.time()
+                
+                batch_scores, batch_cache_hits, batch_api_calls = llm_scorer.score_batch(batch_requests, max_workers=max_workers)
+                
+                elapsed = time.time() - start_time
+                logger.info(f"批量评分完成: {len(batch_scores)} 个信号，耗时 {elapsed:.1f}秒，平均 {elapsed/len(batch_scores)*1000:.1f}ms/信号")
+                logger.info(f"LLM统计: 共 {batch_api_calls} 次API调用, {batch_cache_hits} 次缓存命中")
+                
+                # 将评分结果映射到信号
+                for (idx, direction, _), score in zip(candidate_signals, batch_scores):
+                    ai_scores[(idx, direction)] = score
+                
+                llm_call_count = batch_api_calls
+                llm_cache_hits = batch_cache_hits
+                
+            except Exception as e:
+                llm_error_count += 1
+                logger.error(f"批量评分失败: {e}")
+                # 批量评分失败时，才真正禁用LLM
+                llm_failed = True
+                if llm_fallback_enabled:
+                    logger.warning("将回退到传统AI模型")
+                else:
+                    logger.warning("将使用默认评分50.0（LLM_FALLBACK_TO_AI=false，不回退）")
+        
+        # 如果LLM完全失败且允许回退，使用传统AI模型
+        if llm_failed and llm_fallback_enabled and ai_model is None and runtime_cfg and runtime_cfg.ai_enabled:
+            try:
+                ai_model = _load_ai_model(db, settings, runtime_cfg)
+                ai_model_seen = getattr(ai_model, "seen", 0)
+                if ai_model_seen > 0:
+                    logger.info(f"已加载传统AI模型（训练样本数: {ai_model_seen}）")
+                else:
+                    logger.warning("传统AI模型未训练，将使用默认评分50.0")
+            except Exception as e:
+                logger.debug(f"无法加载传统AI模型: {e}")
+        
+        # 第三阶段：使用真实AI评分重新检查信号
+        for i in range(1, len(rows)):
+            current = rows[i]
+            prev = rows[i - 1]
+            
+            # 获取AI评分
+            ai_score_long = ai_scores.get((i, "LONG"), 50.0)
+            ai_score_short = ai_scores.get((i, "SHORT"), 50.0)
+            
+            # 如果没有LLM评分，使用传统AI模型
+            if ai_score_long == 50.0 and ai_score_short == 50.0 and ai_model is not None:
                 try:
                     x, feat_bundle = _vectorize_for_ai(current)
-                    ai_prob = float(ai_model.predict_proba(x))
-                    ai_score = ai_prob * 100.0  # 转换为0-100的评分
+                    proba_result = ai_model.predict_proba(x)
+                    if isinstance(proba_result, list):
+                        ai_prob = float(proba_result[1])
+                    else:
+                        ai_prob = float(proba_result)
+                    ai_score = ai_prob * 100.0
+                    ai_score_long = ai_score
+                    ai_score_short = ai_score
                 except Exception as e:
-                    # 如果AI预测失败，使用默认值
-                    ai_score = 50.0
+                    logger.debug(f"AI预测失败: {e}")
             
-            # 检查做多信号
+            # 使用真实AI评分检查信号
             if check_combination(
                 current,
                 prev,
                 condition_names=condition_names,
                 runtime_cfg=runtime_cfg,
                 settings=settings,
-                ai_score=ai_score,
+                ai_score=ai_score_long,
                 direction="LONG",
             ):
-                signals.append({"idx": i, "direction": "LONG", "ai_score": ai_score})
+                signals.append({"idx": i, "direction": "LONG", "ai_score": ai_score_long})
             
-            # 检查做空信号（使用相反的条件）
             if check_combination(
                 current,
                 prev,
                 condition_names=condition_names,
                 runtime_cfg=runtime_cfg,
                 settings=settings,
-                ai_score=ai_score,
+                ai_score=ai_score_short,
                 direction="SHORT",
             ):
-                signals.append({"idx": i, "direction": "SHORT", "ai_score": ai_score})
+                signals.append({"idx": i, "direction": "SHORT", "ai_score": ai_score_short})
+            
+            # 每1000条K线打印一次进度
+            if (i + 1) % 1000 == 0:
+                logger.info(f"信号分析进度: {i + 1}/{len(rows) - 1} ({100.0 * (i + 1) / (len(rows) - 1):.1f}%), 已找到 {len(signals)} 个信号")
+        
+        if llm_scorer is not None:
+            logger.info(f"LLM统计: 共 {llm_call_count} 次API调用, {llm_cache_hits} 次缓存命中")
         
         logger.info(f"找到 {len(signals)} 个信号")
         
@@ -707,19 +890,31 @@ def run_detailed_backtest(
             
             # 使用信号中的AI评分（如果已计算），否则重新计算
             ai_score_for_trade = signal.get("ai_score", 50.0)
-            if ai_model is not None and ai_score_for_trade == 50.0:
-                try:
-                    x, feat_bundle = _vectorize_for_ai(kline)
-                    # 根据模型类型调用不同的predict_proba
-                    proba_result = ai_model.predict_proba(x)
-                    if isinstance(proba_result, list):
-                        ai_prob = float(proba_result[1])  # SGDClassifierCompat返回[prob_0, prob_1]
-                    else:
-                        ai_prob = float(proba_result)  # OnlineLogisticRegression返回float
-                    ai_score_for_trade = ai_prob * 100.0
-                except Exception as e:
-                    logger.debug(f"AI预测失败: {e}")
-                    ai_score_for_trade = 50.0
+            
+            # 如果评分是默认值，尝试重新计算
+            if ai_score_for_trade == 50.0:
+                # 优先使用LLM评分器
+                if llm_scorer is not None:
+                    try:
+                        features = _parse_json_maybe(kline.get("features_json"))
+                        ai_score_for_trade = llm_scorer.score(features, symbol=symbol, direction=signal_direction)
+                    except Exception as e:
+                        logger.debug(f"LLM评分失败: {e}")
+                        ai_score_for_trade = 50.0
+                # 如果没有LLM，使用传统AI模型
+                elif ai_model is not None:
+                    try:
+                        x, feat_bundle = _vectorize_for_ai(kline)
+                        # 根据模型类型调用不同的predict_proba
+                        proba_result = ai_model.predict_proba(x)
+                        if isinstance(proba_result, list):
+                            ai_prob = float(proba_result[1])  # SGDClassifierCompat返回[prob_0, prob_1]
+                        else:
+                            ai_prob = float(proba_result)  # OnlineLogisticRegression返回float
+                        ai_score_for_trade = ai_prob * 100.0
+                    except Exception as e:
+                        logger.debug(f"AI预测失败: {e}")
+                        ai_score_for_trade = 50.0
             
             base_margin_usdt = compute_base_margin_usdt(equity_usdt=current_equity, ai_score=ai_score_for_trade, settings=settings)
             

@@ -615,6 +615,31 @@ def main() -> None:
     p_restart = sub.add_parser("restart", help="重启服务")
     p_restart.add_argument("service", type=str, choices=["data-syncer", "strategy-engine", "api-service", "all"], help="要重启的服务")
 
+    p_train_ai = sub.add_parser("train-ai", help="使用历史交易数据训练AI模型")
+    p_train_ai.add_argument("--symbol", type=str, default=None, help="只训练指定交易对的模型（默认：所有交易对）")
+    p_train_ai.add_argument("--min-trades", type=int, default=10, dest="min_trades", help="最少需要多少笔交易才进行训练（默认：10）")
+    p_train_ai.add_argument("--max-trades", type=int, default=None, dest="max_trades", help="最多使用多少笔交易（默认：使用所有）")
+    p_train_ai.add_argument("--dry-run", action="store_true", dest="dry_run", help="只显示统计信息，不实际训练和保存模型")
+
+    p_train_ai_backtest = sub.add_parser("train-ai-backtest", help="使用回测数据训练AI模型")
+    p_train_ai_backtest.add_argument("--symbol", type=str, required=True, help="交易对符号（必需）")
+    p_train_ai_backtest.add_argument("--combinations", type=str, nargs="+", required=True, help="要测试的组合，用+连接（必需）")
+    p_train_ai_backtest.add_argument("--months", type=int, default=6, help="回测月数（默认：6）")
+    p_train_ai_backtest.add_argument("--interval", type=int, default=None, dest="interval_minutes", help="K线周期（分钟，默认使用配置）")
+    p_train_ai_backtest.add_argument("--min-trades", type=int, default=10, dest="min_trades", help="最少需要多少笔交易才进行训练（默认：10）")
+    p_train_ai_backtest.add_argument("--max-trades", type=int, default=None, dest="max_trades", help="最多使用多少笔交易（默认：使用所有）")
+    p_train_ai_backtest.add_argument("--dry-run", action="store_true", dest="dry_run", help="只显示统计信息，不实际训练和保存模型")
+
+    p_train_ai_multi = sub.add_parser("train-ai-multi", help="使用多种信号组合训练AI模型（推荐：综合评估多种信号）")
+    p_train_ai_multi.add_argument("--symbol", type=str, required=True, help="交易对符号（必需）")
+    p_train_ai_multi.add_argument("--combinations", type=str, nargs="+", required=True, help="要测试的组合列表，用+连接（必需，建议提供多个组合）")
+    p_train_ai_multi.add_argument("--months", type=int, default=6, help="回测月数（默认：6）")
+    p_train_ai_multi.add_argument("--interval", type=int, default=None, dest="interval_minutes", help="K线周期（分钟，默认使用配置）")
+    p_train_ai_multi.add_argument("--min-trades", type=int, default=50, dest="min_trades", help="最少需要多少笔交易才进行训练（默认：50）")
+    p_train_ai_multi.add_argument("--max-trades", type=int, default=None, dest="max_trades", help="最多使用多少笔交易（默认：使用所有）")
+    p_train_ai_multi.add_argument("--dry-run", action="store_true", dest="dry_run", help="只显示统计信息，不实际训练和保存模型")
+    p_train_ai_multi.add_argument("--no-balance", action="store_true", dest="no_balance", help="不平衡正负样本（默认会平衡，避免模型偏向某一类）")
+
     p_arm_stop = sub.add_parser("arm-stop", help="启用保护止损订单")
     p_arm_stop.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
     p_arm_stop.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 ADMIN_UPDATE_CONFIG）")
@@ -1096,6 +1121,40 @@ def main() -> None:
             )
         print(f"OK trace_id={trace_id}")
         return
+
+    if args.cmd == "train-ai":
+        from scripts.train_ai_from_trades import train_ai_from_trades
+        raise SystemExit(train_ai_from_trades(
+            symbol=getattr(args, "symbol", None),
+            min_trades=getattr(args, "min_trades", 10),
+            max_trades=getattr(args, "max_trades", None),
+            dry_run=getattr(args, "dry_run", False),
+        ))
+
+    if args.cmd == "train-ai-backtest":
+        from scripts.train_ai_from_backtest import train_ai_from_backtest
+        raise SystemExit(train_ai_from_backtest(
+            symbol=getattr(args, "symbol"),
+            combinations=getattr(args, "combinations"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval_minutes", None),
+            min_trades=getattr(args, "min_trades", 10),
+            max_trades=getattr(args, "max_trades", None),
+            dry_run=getattr(args, "dry_run", False),
+        ))
+
+    if args.cmd == "train-ai-multi":
+        from scripts.train_ai_from_multiple_combinations import train_ai_from_multiple_combinations
+        raise SystemExit(train_ai_from_multiple_combinations(
+            symbol=getattr(args, "symbol"),
+            combinations=getattr(args, "combinations"),
+            months=getattr(args, "months", 6),
+            interval_minutes=getattr(args, "interval_minutes", None),
+            min_trades=getattr(args, "min_trades", 50),
+            max_trades=getattr(args, "max_trades", None),
+            dry_run=getattr(args, "dry_run", False),
+            balance_labels=not getattr(args, "no_balance", False),
+        ))
 
 
 if __name__ == "__main__":

@@ -107,15 +107,18 @@ def check_ai_model_status():
         print("4. 检查 system_config 表中的模型配置")
         print("=" * 80)
         
-        config_rows = db.fetch_all("""
+        config_rows = db.fetch_all(
+            """
             SELECT 
                 key,
                 LENGTH(value) as value_length,
                 updated_at
             FROM system_config
-            WHERE key LIKE '%AI_MODEL%' OR key LIKE '%ai_model%'
+            WHERE key LIKE %s OR key LIKE %s
             ORDER BY updated_at DESC
-        """)
+            """,
+            ('%AI_MODEL%', '%ai_model%')
+        )
         
         if not config_rows:
             print("❌ system_config 表中没有AI模型相关的配置")

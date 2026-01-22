@@ -177,7 +177,11 @@ def migrate(db: PostgreSQL, migrations_dir: Path) -> List[str]:
                         continue
                     # For other errors, re-raise
                     raise
-            cur.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (version,))
+            
+            # Check if version already exists before inserting (avoid race condition)
+            cur.execute("SELECT version FROM schema_migrations WHERE version = %s", (version,))
+            if cur.fetchone() is None:
+                cur.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (version,))
         ran.append(p.name)
 
     return ran
